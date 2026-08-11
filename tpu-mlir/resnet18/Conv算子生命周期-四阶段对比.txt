@@ -1,0 +1,186 @@
+================================================================================
+  Conv 算子完整生命周期 — 同一个 7×7 卷积的四种形态（组会汇报用）
+================================================================================
+
+总览流水线：
+
+   ONNX prototxt → origin.mlir → resnet18.mlir → tpu.mlir → final.mlir
+                    [阶段①]      [阶段②]         [阶段③]     [阶段④]
+                    model_       Canonicalize    TopToTpu    LayerGroup
+                    transform    (融合)          Lowering    +Codegen
+
+
+================================================================================
+  阶段① origin.mlir  ——  model_transform 刚转换完，硬件无关的初始形态
+================================================================================
+
+  %4 = "top.Conv"(%1, %2, %3) {
+    auto_pad = "NOTSET",
+    dilations = [1, 1],
+    do_relu = false,                        ◀──┬── 注意：还没融合！
+    dynweight_reorderd = false,                │
+    group = 1 : i64,                           │
+    kernel_shape = [7, 7],                     │
+    pads = [3, 3, 3, 3],                       │
+    relu_limit = -1.000000e+00 : f64,          │
+    strides = [2, 2],                          │
+    weight_is_coeff = 1 : i64                  │
+  } : (tensor<1x3x224x224xf32>,              ◀──┬── f32 全精度
+       tensor<64x3x7x7xf32>,                   │
+       tensor<64xf32>)                          │
+    -> tensor<*xf32>                          ◀──┬── 输出 shape 未推断
+                                                    │
+  %5 = "top.Relu"(%4) {...}                  ◀──┴── ReLU 是独立的一行 Op
+
+  关键特征：top.Conv | do_relu=false | 独立 ReLU | f32 | 输出 shape=*
+
+
+================================================================================
+  阶段② resnet18.mlir  ——  Canonicalize 融合后
+================================================================================
+
+  %3 = "top.Conv"(%0, %1, %2) {
+    dilations = [1, 1],
+    do_relu = true,                         ◀── 🟢[变化] false→true  ReLU 被吸收进去了！
+    dynweight_reorderd = false,
+    group = 1 : i64,
+    kernel_shape = [7, 7],
+    pads = [3, 3, 3, 3],
+    relu_limit = -1.000000e+00 : f64,
+    strides = [2, 2],
+    weight_is_coeff = 1 : i64
+  } : (tensor<1x3x224x224xf32>,             ◀── 仍是 f32（不变）
+       tensor<64x3x7x7xf32>,
+       tensor<64xf32>)
+    -> tensor<1x64x112x112xf32>             ◀── 🟢[变化] *xf32 → 1x64x112x112xf32  shape 已推断
+
+  ~~%5 = "top.Relu"(%4) {...}~~              ◀── 🔴[删除] 独立的 ReLU Op 被删掉了！
+
+  关键特征：top.Conv | do_relu=true | ReLU 消失 | f32 | 输出 shape 确定
+  变化总结：🟢 do_relu 变 true  🔴 独立 ReLU 删除  🟢 shape 推断完成
+
+
+================================================================================
+  阶段③ tpu.mlir  ——  TopToTpu Lowering 后（最关键的转换）
+================================================================================
+
+  %5 = "tpu.Conv2D"(%2, %4, %3) {          ◀── 🟢[变化] 算子名变了！ top.Conv → tpu.Conv2D
+    coeff_merged = false,                   ◀── 🟢[新增] 新增属性
+    dilations = [1, 1],
+    do_relu = true,                         ◀── 保持（融合已完成）
+    dynweight_reorderd = false,
+    group = 1 : i64,
+    kernel_shape = [7, 7],
+    kernel_zp = 0 : i64,                    ◀── 🟢[新增] kernel zero_point
+    pads = [3, 3, 3, 3],
+    quant_mode = #tpu<rq_mode MultiplierShift>,  ◀── 🟢[新增] 量化模式
+    relu_limit = -1.000000e+00 : f64,
+    round_mode = #tpu<round_mode HalfUp>,   ◀── 🟢[新增] 舍入模式
+    strides = [2, 2],
+    support_compress = true,                ◀── 🟢[新增] 新增属性
+    use_3ic_optimize = 0 : i64,             ◀── 🟢[新增] 新增属性
+    weight_is_coeff = 1 : i64,
+    with_bias = true                        ◀── 🟢[新增] 显式标注带 bias
+  } : (tensor<1x3x224x224xf16>,             ◀── 🟢[变化] f32 → f16  ！
+       tensor<64x3x7x7xf16>,                ◀── 🟢[变化] weight 也 f32 → f16
+       tensor<64xf32>)                      ◀── bias 保持 f32
+    -> tensor<1x64x112x112xf16>             ◀── 🟢[变化] 输出 f32 → f16
+
+  关键特征：tpu.Conv2D | f16 | +quant_mode | +kernel_zp | +round_mode | +with_bias
+  变化总结：🟢 算子名变化  🟢 f32→f16  🟢 新增5个芯片属性
+
+
+================================================================================
+  阶段④ final.mlir  ——  LayerGroup + Codegen 后（芯片就绪状态）
+================================================================================
+
+  %53 = "tpu.Conv2D"(%48, %50, %49) {
+    coeff_merged = false,
+    dilations = [1, 1],
+    do_relu = true,
+    dynweight_reorderd = false,
+    ginfo = #tpu.lg<                       ◀── 🟢[新增] 最关键的！ local memory 布局信息
+      out_addr = 32768,                    ◀── 输出在 local mem 的起始地址
+      out_size = 25088,                    ◀── 输出占用 25KB
+      buffer_addr = 65536,                 ◀── 临时 buffer 起始地址
+      buffer_size = 50318,                 ◀── buffer 占用 50KB
+      eu_align = true,                     ◀── 硬件对齐
+      can_merge = false,                   ◀── 可否与邻居合并
+      n_idx=[0], n_slice=[1],              ◀── N 维度：不切
+      c_idx=[0], c_slice=[64],             ◀── C 维度：64 通道全算
+      h_idx=[0], h_slice=[112],            ◀── H 维度：112 行全算
+      w_idx=[0], w_slice=[112],            ◀── W 维度：112 列全算
+      id = 5,                              ◀── Group 内第 5 个 Op
+      stage = 1,                           ◀── 流水线阶段：1=计算阶段
+      slice_idx = 0,                       ◀── 切分索引
+      group_type = 0                       ◀── 组类型
+    >,
+    group = 1 : i64,
+    kernel_shape = [7, 7],
+    kernel_zp = 0 : i64,
+    pads = [3, 3, 3, 3],
+    quant_mode = #tpu<rq_mode MultiplierShift>,
+    relu_limit = -1.000000e+00 : f64,
+    round_mode = #tpu<round_mode HalfUp>,
+    strides = [2, 2],
+    support_compress = true,
+    use_3ic_optimize = 17 : i64,           ◀── 🟢[变化] 0 → 17  优化参数变了！
+    weight_is_coeff = 1 : i64,
+    with_bias = true
+  } : (tensor<1x3x224x224xf16>,
+       tensor<1x64x1x224xf16>,             ◀── 🟢[变化] weight 形状变了！
+       tensor<1x64x1x1xf32>)               ◀──    [64,3,7,7] → [1,64,1,224]
+    -> tensor<1x64x112x112xf16>                 WeightReorder 重排过了
+
+  所在结构：嵌在 tpu.Group { ... } 里面      ◀── 🟢[新增] 不再是平铺 Op！
+
+  关键特征：+ginfo(地址+切分+流水) | weight 重排 | use_3ic_optimize=17 | 在 tpu.Group 内
+  变化总结：🟢 ginfo 地址信息  🟢 weight 形状重排  🟢 use_3ic_optimize 变化  🟢 嵌入 tpu.Group
+
+
+================================================================================
+  四阶段并排对比（PPT 可以直接截图这行）
+================================================================================
+
+          origin.mlir          resnet18.mlir         tpu.mlir              final.mlir
+          ───────────          ─────────────         ────────              ──────────
+算子名     top.Conv             top.Conv             tpu.Conv2D            tpu.Conv2D
+do_relu    false                true                 true                  true
+独立ReLU   有                   ✗删除                ✗                     ✗
+输出shape  *xf32                1x64x112x112xf32     1x64x112x112xf16      1x64x112x112xf16
+精度       f32                  f32                  f16                   f16
+quant_mode ✗                    ✗                    MultiplierShift       MultiplierShift
+kernel_zp  ✗                    ✗                    0                     0
+round_mode ✗                    ✗                    HalfUp                HalfUp
+weight     [64,3,7,7]          [64,3,7,7]           [64,3,7,7]            [1,64,1,224]
+ginfo      ✗                    ✗                    ✗                     ✓(地址+切分)
+所在结构   平铺                 平铺                  平铺                  tpu.Group内
+
+
+================================================================================
+  逐阶段变化用一句话讲
+================================================================================
+
+  ①→② Canonicalize：
+       Conv+ReLU 融合 → do_relu=false 变 true，独立 ReLU 删除，shape 推断完成
+
+  ②→③ TopToTpu Lowering：
+       top.Conv → tpu.Conv2D（芯片专用），f32 → f16（半精度），
+       新增 quant_mode/kernel_zp/round_mode/with_bias 等芯片属性
+
+  ③→④ LayerGroup + Codegen：
+       新增 ginfo（local memory 地址+切分+流水阶段），
+       weight 被 WeightReorder 重排 [64,3,7,7] → [1,64,1,224]，
+       use_3ic_optimize 从 0 变 17，嵌入 tpu.Group 结构
+
+
+================================================================================
+  图例说明
+================================================================================
+
+  🟢[新增]  — 上一阶段没有，这一阶段新出现
+  🟢[变化]  — 上一阶段有，但值/名字/类型变了
+  🔴[删除]  — 上一阶段有，这一阶段消失了
+  ◀──      — 指向具体变化点
+  ~~..~~   — 被删除的内容
+

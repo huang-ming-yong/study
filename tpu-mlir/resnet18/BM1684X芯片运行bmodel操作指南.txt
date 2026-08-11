@@ -1,0 +1,419 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                                                                              ║
+║           BM1684X 芯片上运行 bmodel 操作指南（新手向）                        ║
+║                                                                              ║
+║           第三周任务：将编译好的 .bmodel 部署到芯片并运行推理                 ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【重要前置知识】Docker 与芯片的关系
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ⚠️  关键点：Docker 容器是用来 编译 模型的，而 bmodel 推理需要在
+      芯片服务器 宿主机（Host）上运行！
+
+  原因：TPU 芯片驱动（libsophon）安装在宿主机，Docker 容器内通常没有
+        芯片驱动，无法直接访问 BM1684X 硬件。
+
+  如果你的 bmodel 文件还在 Docker 容器里，请先按下面的步骤拷贝出来。
+
+  你的当前状态：
+  ✅ 已远程 SSH 连接到 BM1684X 芯片服务器
+  ✅ 已有 .bmodel 文件（resnet18_f16.bmodel, resnet18_int8.bmodel）
+  ✅ bmodel 文件已上传到芯片服务器的 Docker 容器中
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第一步：将 bmodel 从 Docker 容器拷贝到宿主机
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  你的 bmodel 在 Docker 容器里，需要先拷贝到宿主机（芯片服务器本身）。
+
+  ── 1.1 在宿主机上查看正在运行的容器 ──
+
+      docker ps
+
+  你会看到类似这样的输出：
+
+      CONTAINER ID   IMAGE                  STATUS          NAMES
+      a1b2c3d4e5f6   sophgo/tpuc_dev:latest  Up 2 hours      tpu-mlir
+
+  记住容器的名称（NAMES 列），例如：tpu-mlir
+
+  ── 1.2 从容器中拷贝 bmodel 文件到宿主机 ──
+
+      # 格式：docker cp <容器名>:<容器内路径> <宿主机路径>
+      docker cp tpu-mlir:/workspace/resnet18_f16.bmodel   ~/
+      docker cp tpu-mlir:/workspace/resnet18_int8.bmodel  ~/
+
+  💡 提示：如果不确定 bmodel 在容器内的位置，可以先进容器查看：
+
+      docker exec -it tpu-mlir bash   # 进入容器
+      find /workspace -name "*.bmodel"  # 查找所有 bmodel 文件
+      exit                            # 退出容器
+
+  ── 1.3 确认拷贝成功 ──
+
+      ls -lh ~/*.bmodel
+
+  应该能看到两个 .bmodel 文件。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第二步：检查芯片驱动是否已安装
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  BM1684X 芯片需要安装 libsophon 驱动才能使用。
+
+  ── 2.1 检查 libsophon 是否安装 ──
+
+      ls /opt/sophon/libsophon-current/lib/  2>/dev/null && echo "✅ 驱动已安装" || echo "❌ 驱动未安装"
+
+  ── 2.2 检查 TPU 设备是否存在 ──
+
+      ls /dev/bm*  2>/dev/null && echo "✅ TPU 设备已识别" || echo "❌ 未找到 TPU 设备"
+
+  正常应该看到类似 /dev/bm1684x-0 或 /dev/bmsophon 的设备文件。
+
+  ── 2.3 如果驱动未安装，需要安装 libsophon ──
+
+      参考 SOPHGO 官方文档安装 libsophon：
+      https://doc.sophgo.com/sdk-docs/v23.09.01/docs_latest_release/docs/sophon-driver/driver_install_guide.html
+
+      或者使用 apt 安装（如果芯片服务器有网络）：
+
+      sudo apt update
+      sudo apt install sophon-libsophon-dev
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第三步：使用 bmrt_test 快速测试 bmodel（推荐第一步做这个）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  bmrt_test 是 libsophon 自带的 bmodel 测试工具，可以快速验证：
+  - bmodel 是否能在芯片上正确加载
+  - 模型的输入/输出信息（shape、dtype）
+  - 推理耗时（性能）
+
+  ── 3.1 运行 bmrt_test ──
+
+      cd ~/   # 切换到 bmodel 所在目录
+      bmrt_test --bmodel resnet18_f16.bmodel
+      bmrt_test --bmodel resnet18_int8.bmodel
+
+  ── 3.2 解读 bmrt_test 输出 ──
+
+      关键信息：
+      ┌──────────────────────────────────────────────────────────────┐
+      │ [show_net_info]  NetName: xxx, Index=0                       │
+      │   Input 0) 'input' shape=[ 1 3 224 224 ] dtype=FLOAT32       │  ← 输入信息
+      │   Output 0) 'output' shape=[ 1 1000 ] dtype=FLOAT32          │  ← 输出信息
+      │                                                              │
+      │ [bmrt_test] calculate time(s): 0.004132                      │  ← NPU 计算时间
+      │ [bmrt_test] load input time(s): 0.008914                     │  ← 数据加载时间
+      └──────────────────────────────────────────────────────────────┘
+
+      重点关注：
+      - calculate time：芯片纯推理时间，越小越好
+      - 输入/输出的 shape 和 dtype，后续 model_runner 需要用 npz 格式匹配
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第四步：准备测试输入数据（.npz 文件）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  model_runner.py 需要用 .npz 格式的 numpy 数组作为输入。
+
+  ── 4.1 查看你的 bmodel 需要的输入格式 ──
+
+      # 用 model_tool 查看 bmodel 信息
+      model_tool --info resnet18_f16.bmodel
+
+  输出示例：
+
+      Chip: BM1684X
+      Input:
+        - input.1  : [1, 3, 224, 224]  float32  (F32)
+      Output:
+        - 495      : [1, 1000]  float32  (F32)
+
+  记住输入的 name（如 input.1）和 shape（如 [1, 3, 224, 224]）。
+
+  ── 4.2 创建测试用的输入数据 ──
+
+  方法一：生成随机数据（快速测试用）
+
+      在芯片服务器上运行 Python：
+
+      python3 << 'EOF'
+      import numpy as np
+      # 根据你的 bmodel 输入 shape 调整，例如 [1, 3, 224, 224]
+      input_data = np.random.randn(1, 3, 224, 224).astype(np.float32)
+      np.savez("resnet18_test_input.npz", **{"input.1": input_data})
+      print("✅ 已生成测试输入: resnet18_test_input.npz")
+      print(f"   数据 Shape: {input_data.shape}")
+      print(f"   数据 dtype: {input_data.dtype}")
+      EOF
+
+      ⚠️  注意：key 名称 "input.1" 要和 bmrt_test 显示的 Input name 一致！
+
+  方法二：用真实图片生成（效果验证用）
+
+      如果你的 resnet18 是 ImageNet 分类模型，可以用真实图片：
+
+      python3 << 'EOF'
+      import numpy as np
+      from PIL import Image
+
+      # 读取图片并预处理（ImageNet 标准预处理）
+      img = Image.open("your_image.jpg").convert("RGB")
+      img = img.resize((224, 224))
+      img_array = np.array(img).astype(np.float32)
+      # 标准化：减均值，除标准差
+      mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+      std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+      img_array = img_array / 255.0
+      img_array = (img_array - mean) / std
+      # 转换为 NCHW 格式 [1, 3, 224, 224]
+      img_array = img_array.transpose(2, 0, 1)[np.newaxis, :]
+      np.savez("resnet18_test_input.npz", **{"input.1": img_array})
+      print("✅ 已生成图片测试输入: resnet18_test_input.npz")
+      print(f"   数据 Shape: {img_array.shape}")
+      EOF
+
+      如果没有测试图片，可以先下载一张：
+
+      wget https://github.com/pytorch/hub/raw/master/images/dog.jpg -O dog.jpg
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第五步：使用 model_runner.py 在芯片上运行推理
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  model_runner.py 是 TPU-MLIR 提供的通用推理工具，支持在芯片上运行 bmodel。
+
+  ── 5.1 确认 model_runner.py 可用 ──
+
+      which model_runner.py && echo "✅ 工具已就绪" || echo "❌ 需要安装"
+
+  如果不可用，需要先安装 tpu_mlir（或从 tpu-mlir 项目源码中使用）：
+
+      # 在宿主机上安装（推荐）
+      pip3 install tpu_mlir
+
+      # 或者直接从源码目录使用
+      cd /path/to/tpu-mlir
+      source envsetup.sh
+      use_chip   # 切换到芯片模式！
+
+  ── 5.2 切换到芯片模式 ──
+
+      ⚠️  重要：运行前必须切换到芯片模式，否则会用模拟器（慢且不测芯片）
+
+      # 如果使用 tpu-mlir 源码
+      source /path/to/tpu-mlir/envsetup.sh
+      use_chip
+
+      # use_chip 函数的作用：
+      #   export USING_CMODEL=False
+      #   export LD_LIBRARY_PATH=/opt/sophon/libsophon-current/lib/:...
+
+  ── 5.3 运行推理 ──
+
+      model_runner.py \
+        --input  resnet18_test_input.npz \
+        --model  resnet18_f16.bmodel \
+        --output resnet18_f16_output.npz
+
+      model_runner.py \
+        --input  resnet18_test_input.npz \
+        --model  resnet18_int8.bmodel \
+        --output resnet18_int8_output.npz
+
+  ── 5.4 运行 F16 和 INT8 的精度对比 ──
+
+      如果你的 CPU 参考输出还在（cpu_ref_output.npz），可以做精度对比：
+
+      python3 << 'EOF'
+      import numpy as np
+
+      # 加载三个输出
+      f16   = np.load("resnet18_f16_output.npz")
+      int8  = np.load("resnet18_int8_output.npz")
+
+      # 查看有哪些 key
+      print("F16  output keys:", list(f16.keys()))
+      print("INT8 output keys:", list(int8.keys()))
+
+      # 对比 F16 和 INT8 输出的差异
+      for key in f16.keys():
+          if key in int8:
+              diff = np.abs(f16[key] - int8[key])
+              print(f"\n[{key}] F16 vs INT8:")
+              print(f"  Max diff:  {diff.max():.6f}")
+              print(f"  Mean diff: {diff.mean():.6f}")
+              print(f"  F16  range: [{f16[key].min():.4f}, {f16[key].max():.4f}]")
+              print(f"  INT8 range: [{int8[key].min():.4f}, {int8[key].max():.4f}]")
+      EOF
+
+  ── 5.5 查看推理结果 ──
+
+      python3 << 'EOF'
+      import numpy as np
+
+      data = np.load("resnet18_f16_output.npz")
+      for key in data.keys():
+          arr = data[key]
+          print(f"Output '{key}': shape={arr.shape}, dtype={arr.dtype}")
+          if arr.ndim <= 2 and arr.size <= 20:
+              print(f"  Values: {arr}")
+          else:
+              # 输出 Top-5（分类任务）
+              if arr.ndim == 2 and arr.shape[0] == 1:  # [1, 1000] 分类任务
+                  top5_idx = np.argsort(arr[0])[-5:][::-1]
+                  top5_val = arr[0][top5_idx]
+                  print(f"  Top-5 indices: {top5_idx}")
+                  print(f"  Top-5 values:  {top5_val}")
+              else:
+                  print(f"  First few: {arr.flatten()[:10]}")
+      EOF
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第六步：使用 model_tool 查看 bmodel 详细信息
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  model_tool 是 bmodel 的"瑞士军刀"，可以查看模型结构、芯片类型、输入输出等。
+
+  ── 6.1 查看简要信息 ──
+
+      model_tool --info resnet18_f16.bmodel
+      model_tool --info resnet18_int8.bmodel
+
+  ── 6.2 查看完整信息 ──
+
+      model_tool --print resnet18_f16.bmodel | less
+
+  ── 6.3 确认芯片类型 ──
+
+      model_tool --chip resnet18_f16.bmodel
+      # 应该输出: BM1684X
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第七步：（进阶）性能对比：F16 vs INT8
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  学习目标：对比 F16 和 INT8 量化模型的推理速度和精度差异。
+
+  ── 7.1 性能对比 ──
+
+      分别运行 bmrt_test，记录 calculate time：
+
+      bmrt_test --bmodel resnet18_f16.bmodel  2>&1 | grep "calculate time"
+      bmrt_test --bmodel resnet18_int8.bmodel 2>&1 | grep "calculate time"
+
+      预期结果：
+      - INT8 推理速度 大约是 F16 的 2 倍
+      - F16 精度更高，INT8 有轻微精度损失
+
+  ── 7.2 精度对比 ──
+
+      如果你有 CPU 参考输出（ONNX 在 CPU 上跑的结果），可以做完整对比：
+
+      python3 << 'EOF'
+      import numpy as np
+
+      # 如果你有 CPU 参考输出
+      try:
+          cpu_ref = np.load("cpu_ref_output.npz")
+          f16_out = np.load("resnet18_f16_output.npz")
+          int8_out = np.load("resnet18_int8_output.npz")
+
+          for key in cpu_ref.keys():
+              if key in f16_out and key in int8_out:
+                  ref = cpu_ref[key]
+                  f16_diff = np.abs(f16_out[key] - ref)
+                  int8_diff = np.abs(int8_out[key] - ref)
+                  print(f"\n[{key}]")
+                  print(f"  F16  vs CPU: max_diff={f16_diff.max():.6f}, mean_diff={f16_diff.mean():.6f}")
+                  print(f"  INT8 vs CPU: max_diff={int8_diff.max():.6f}, mean_diff={int8_diff.mean():.6f}")
+      except FileNotFoundError:
+          print("未找到 cpu_ref_output.npz，跳过精度对比")
+      EOF
+
+  ── 7.3 填写学习报告 ──
+
+      记录以下数据用于学习总结：
+
+      ┌────────────────────┬──────────────┬───────────────┐
+      │       指标          │     F16      │     INT8      │
+      ├────────────────────┼──────────────┼───────────────┤
+      │ 计算时间 (ms)       │      ?       │       ?       │
+      │ bmodel 文件大小     │      ?       │       ?       │
+      │ 与 CPU 的最大误差   │      ?       │       ?       │
+      │ 与 CPU 的平均误差   │      ?       │       ?       │
+      └────────────────────┴──────────────┴───────────────┘
+
+      获取文件大小：ls -lh resnet18_*.bmodel
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【常见问题排查】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ❌ "bmrt_test: command not found"
+     → libsophon 未安装或未加入 PATH
+     → 解决：apt install sophon-libsophon-dev
+     → 或查找：find /opt/sophon -name "bmrt_test"
+
+  ❌ "Cannot open /dev/bm*"
+     → TPU 设备不存在或没有权限
+     → 解决：sudo chmod 666 /dev/bm*  或  sudo usermod -aG bm $USER
+
+  ❌ "model_runner.py: command not found"
+     → tpu_mlir 未安装或未 source envsetup.sh
+     → 解决：pip3 install tpu_mlir 或 source /path/to/tpu-mlir/envsetup.sh
+
+  ❌ "ImportError: libbmlib.so: cannot open shared object file"
+     → 驱动库路径未设置
+     → 解决：export LD_LIBRARY_PATH=/opt/sophon/libsophon-current/lib/:$LD_LIBRARY_PATH
+
+  ❌ "Shape mismatch"
+     → 输入 shape 与 bmodel 不匹配
+     → 解决：用 bmrt_test 查看正确 shape，调整 .npz 数据
+
+  ❌ Docker 内 bmrt_test 报错找不到设备
+     → Docker 容器默认无法访问 TPU 硬件
+     → 解决：退出容器，在宿主机上运行（按第一步操作）
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【学习要点总结】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  通过这次操作，你将学会：
+
+  1. 理解 Docker 编译 vs 芯片部署的环境区别
+  2. 使用 docker cp 在容器和主机间传输文件
+  3. 使用 bmrt_test 验证 bmodel 并测试芯片推理性能
+  4. 使用 model_tool 查看 bmodel 内部结构
+  5. 准备合适的输入数据（.npz 格式）
+  6. 使用 model_runner.py 在真实芯片上运行推理
+  7. 对比 F16 和 INT8 模型的性能和精度差异
+  8. 理解量化（Quantization）带来的性能提升和精度损失
+
+  📖 参考文档：
+  - TPU-MLIR 快速入门: https://tpumlir.org/quick_start_en/index.html
+  - SOPHGO 开发者文档: https://doc.sophgo.com/
+  - 项目源码中的示例: tpu-mlir/python/samples/
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  祝你学习顺利！🚀
+
+  如果遇到问题，可以在 TPU-MLIR 的 GitHub Issues 提问：
+  https://github.com/sophgo/tpu-mlir/issues
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
