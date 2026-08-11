@@ -1,0 +1,238 @@
+================================================================================
+  TPU-MLIR  Weight Equalization (权重均衡化) 详解
+================================================================================
+
+一、先有个直观感受
+────────────────────────────────────────────────────────────────────────────────
+
+  量化 Conv 层时，一个常见问题是相邻 Conv 层的输出通道之间权重范围差异巨大。
+
+  ┌─ BEFORE ────────────────────────────┐    ┌─ AFTER ──────────────────────┐
+  │                                     │    │                              │
+  │   ┌───────────┐                     │    │   ┌───────────┐              │
+  │   │   Conv1   │                     │    │   │   Conv1   │              │
+  │   │           │  通道 i 权重范围      │    │   │  W1 ÷ s   │  范围: ±0.11 │
+  │   │  W1  ▎    │  [-0.01, +0.01]     │    │   │  ████▋    │  扩 11 倍 ✓  │
+  │   │      小!  │  太小→量化后≈0      │ ──→│   │  均衡了   │              │
+  │   └─────┬─────┘                     │    │   └─────┬─────┘              │
+  │         │ Y (中间特征)               │    │         │                    │
+  │         ▼                           │    │         ▼                    │
+  │   ┌───────────┐                     │    │   ┌───────────┐              │
+  │   │   Conv2   │                     │    │   │   Conv2   │              │
+  │   │           │  通道 i 权重范围      │    │   │  W2 × s   │  范围: ±0.11 │
+  │   │  W2 ██████│  [-1.20, +1.20]     │    │   │  ████▋    │  缩 11 倍 ✓  │
+  │   │  太大!   │  挤占其他通道精度     │    │   │  均衡了   │              │
+  │   └───────────┘                     │    │   └───────────┘              │
+  │                                     │    │                              │
+  │  通道 i 一个太小、一个太大 →          │    │  W2×s × W1/s = W2×W1        │
+  │  量化精度互相伤害                    │    │  数学等价，谁也牺牲谁          │
+  └─────────────────────────────────────┘    └──────────────────────────────┘
+
+  一句话：在相邻 Conv 层之间"搬运"数值范围，让每一层的权重分布更均匀，
+  从而减少 INT8 量化的精度损失。对 Conv 为主的网络（ResNet、VGG、MobileNet）
+  特别有效。
+
+
+二、数学原理
+────────────────────────────────────────────────────────────────────────────────
+
+  相邻两个 Conv 层：
+
+    Conv1:  Y = W1 × X + b1       (权重 W1, shape: [OC1, IC1, KH1, KW1])
+    Conv2:  Z = W2 × Y + b2       (权重 W2, shape: [OC2, IC2, KH2, KW2])
+
+  其中 Y 有 IC2 个通道，Conv1 的 OC1 = Conv2 的 IC2。
+
+  对于每个通道 i（i ∈ [0, IC2)）：
+
+    缩放因子:  s[i] = range_1[i] / sqrt( range_1[i] × range_2[i] )
+
+    其中:
+      range_1[i] = max(|W1[i, :, :, :]|)     Conv1 输出通道 i 的权重绝对值最大值
+      range_2[i] = max(|W2[:, i, :, :]|)     Conv2 输入通道 i 的权重绝对值最大值
+
+  均衡操作：
+
+    W1_new[i, :, :, :]  = W1[i, :, :, :]  / s[i]
+    b1_new[i]           = b1[i]           / s[i]   (如果 Conv1 有 bias)
+    W2_new[:, i, :, :]  = W2[:, i, :, :]  × s[i]
+
+  可以验证：W2_new × (W1_new × X) = W2 × (W1 × X)，数学等价。
+
+  迭代直到收敛：L2 范数变化 < 1e-4。
+
+
+三、在 TPU-MLIR 中的实现
+
+  核心代码位置：mix_precision.py:1345-1415
+
+  数据流：
+  ────────────────────────────────────────────────────────────
+
+  遍历模型所有 Conv 层
+       │
+       ▼
+  find_successor(op)  ── 找下一个 Conv 层
+       │                  支持模式: Conv → Relu/PRelu/LeakyRelu → Conv
+       │                            Conv → Conv
+       ▼
+  检查 pair 是否有效     只有 1:1 前后继关系的 Conv 对才处理
+       │                  (残差分支、多分支汇合点跳过)
+       ▼
+  按 group 分组处理      支持 grouped convolution
+       │                 num_group = OC1 / IC2
+       ▼
+  逐通道计算 s[i]        公式: range_1 / sqrt(range_1 × range_2)
+       │                 范围过小 (< 1e-6) 的保护: range = 0
+       │                 无穷/NaN 的保护: s = 1.0
+       ▼
+  应用权重缩放           W1 /= s, b1 /= s, W2 *= s
+       │
+       ▼
+  写回 .npz 权重文件     更新到模块权重文件
+       │
+       ▼
+  检查收敛              L2 范数 < 1e-4 则停止，否则继续迭代
+
+
+  关键实现细节：
+
+  1. find_successor (mix_precision.py:1318-1336)
+     - 从当前 Conv 出发，找到下一个 Conv
+     - 中间经过 Relu/PRelu/LeakyRelu 是允许的
+     - 输出必须恰好 1 个后继 Conv，否则跳过（避免破坏多分支拓扑）
+
+  2. 分组卷积支持 (mix_precision.py:1382-1402)
+     - num_group = weight_first.shape[0] / weight_second.shape[1]
+     - 每个 group 独立均衡，避免跨 group 的通道干扰
+
+  3. 数值保护
+     - range_1 < 1e-6 → range_1 = 0 → s = 0 (不均衡)
+     - np.isinf(s) or np.isnan(s) → s = 1.0
+     - converge 阈值 1e-4，防止无限迭代
+
+  4. 仅修改权重文件
+     - weight equalization 在 calibration 阶段执行
+     - 直接修改 FP32 权重 .npz 文件
+     - calibration 和 deploy 后续使用修改后的权重
+
+
+四、使用方式
+
+  ── 方式 A：calibration 时开启（推荐）
+  ──────────────────────────────────────
+
+    run_calibration.py resnet18.mlir \
+        --dataset ./cali_data \
+        --input_num 100 \
+        --chip bm1684x \
+        --we \
+        -o resnet18_cali_table
+
+    效果：在生成校准表之前，先对所有权重做均衡化，再用均衡后的权重做校准。
+    产出 cali_table 已经是"均衡后模型"的阈值。
+
+
+  ── 方式 B：与 Bias Correction 组合
+  ──────────────────────────────────────
+
+    run_calibration.py resnet18.mlir \
+        --dataset ./cali_data \
+        --input_num 100 \
+        --chip bm1684x \
+        --we \
+        --bc \
+        -o resnet18_cali_table
+
+    先做 WE 均衡，再做 BC 修正 bias，两者互补。
+
+
+  ── 方式 C：与 search_threshold 组合
+  ──────────────────────────────────────
+
+    run_calibration.py resnet18.mlir \
+        --dataset ./cali_data \
+        --input_num 100 \
+        --chip bm1684x \
+        --we \
+        --bc \
+        --search search_threshold \
+        -o resnet18_cali_table
+
+
+五、适用场景
+
+  ✓ Conv 层为主的网络               ResNet、VGG、DenseNet 等经典 CNN
+  ✓ Depthwise-Separable Conv        MobileNet、ShuffleNet 等轻量网络
+  ✓ 相邻 Conv 之间有 ReLU 的情况     Conv-BN-ReLU-Conv 是标准 CNN 结构
+  ✓ INT8 量化精度不足时              作为 PTQ 的第一道优化
+
+  ✗ 全连接层 (MatMul) 为主的网络    per-channel 更适用
+  ✗ Transformer / LLM               SmoothQuant 更适用
+  ✗ 残差连接汇合点                  多个前驱的情况会跳过（自动检测）
+  ✗ 单 Conv 层 / 最后一层           找不到后继 Conv，跳过
+
+
+六、与 Per-Channel 的区别
+
+  ┌────────────────────┬──────────────────────────┬──────────────────────────┐
+  │                    │ Weight Equalization      │ Per-Channel Quantization │
+  ├────────────────────┼──────────────────────────┼──────────────────────────┤
+  │ 作用对象           │ Conv 层权重               │ MatMul 层权重            │
+  │ 作用范围           │ 跨层（Conv1 ↔ Conv2）     │ 层内（单 MatMul 的 OC）  │
+  │ 修改权重           │ 是（修改 .npz 权重文件）   │ 否（只改量化参数）        │
+  │ 数学等价性         │ 严格等价                   │ 近似（更多量化参数）      │
+  │ 对计算的影响       │ 无（权重变了，计算量不变）  │ 有（per-channel multiplier）│
+  │ Conv 支持          │ ✓ 原生支持                 │ ✗ 不支持                │
+  │ MatMul 支持        │ ✗ 只处理 top.Conv          │ ✓ 原生支持              │
+  └────────────────────┴──────────────────────────┴──────────────────────────┘
+
+  对于 ResNet18：
+    - Per-Channel: 只有最后的 FC 层受益 → 几乎无效果
+    - Weight Equalization: 17 个 Conv 层中有多对相邻 Conv → 效果明显
+
+
+七、代码索引
+
+  层次          | 文件                                      | 行号    | 作用
+  ──────────────┼───────────────────────────────────────────┼─────────┼─────────────────
+  入口 & 调度   | python/tools/run_calibration.py           | --we    | 命令行参数
+  核心算法     | python/calibration/mix_precision.py       | 1345    | weight_equalization()
+  后继查找     | python/calibration/mix_precision.py       | 1318    | find_successor()
+  收敛判断     | python/calibration/mix_precision.py       | 1338    | converged()
+  权重文件读写 | python/utils/mlir_parser.py               |         | MlirParser
+
+
+八、实操指引 (resnet18)
+
+  # 第 1 步：模型转换
+  model_transform.py \
+      --model_name resnet18 \
+      --model_def resnet18-v1-7.onnx \
+      --input_shapes [[1,3,224,224]] \
+      --resize_dims 256,256 \
+      --mean 123.675,116.28,103.53 \
+      --scale 0.0171,0.0175,0.0174 \
+      --pixel_format rgb \
+      --mlir resnet18.mlir
+
+  # 第 2 步：校准 + Weight Equalization
+  run_calibration.py resnet18.mlir \
+      --dataset ../../regression/dataset/ILSVRC2012 \
+      --input_num 100 \
+      --chip bm1684x \
+      --we \
+      -o resnet18_cali_table_we
+
+  # 第 3 步：部署（正常部署，无额外参数）
+  model_deploy.py \
+      --mlir resnet18.mlir \
+      --chip bm1684x \
+      --quantize INT8 \
+      --calibration_table resnet18_cali_table_we \
+      --model resnet18_int8_we.bmodel
+
+  注意：WE 在 calibration 阶段已经写入了修改后的权重文件，deploy 时
+  无需特殊参数。如果你想同时用 Bias Correction，第 2 步加上 --bc 即可。
+
+================================================================================

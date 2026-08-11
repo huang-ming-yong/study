@@ -1,0 +1,260 @@
+================================================================================
+  TPU-MLIR  Per-Channel 量化 详解
+================================================================================
+
+一、先有个直观感受
+────────────────────────────────────────────────────────────────────────────────
+
+  没有量化的时候，模型权重是 FP32，每个值有自己独立的大小。
+
+  量化到 INT8 时，需要把所有权重统一缩放到 [-127, 127]。问题来了：
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                 │
+  │  Per-Tensor (常规)              Per-Channel                     │
+  │                                                                 │
+  │  整个权重矩阵用一个 scale        每个输出通道用各自的 scale       │
+  │                                                                 │
+  │  OC0: [0.01, 0.03, -0.02]  ─┐  OC0: [0.01, 0.03, -0.02]        │
+  │  OC1: [0.80, 1.20, -0.90]   ├─ 共用一个 scale=1.20/127           │
+  │  OC2: [0.02, 0.01, -0.03]  ─┘  → OC1 占满了 INT8 范围，         │
+  │                                 OC0 和 OC2 被压缩到 1/100         │
+  │  OC0 的精度几乎完全丢失！        → 精度损失严重                    │
+  │                                                                 │
+  │                                 OC0: scale=0.03/127 → 独立范围    │
+  │                                 OC1: scale=1.20/127 → 独立范围    │
+  │                                 OC2: scale=0.03/127 → 独立范围    │
+  │                                 → 每个通道都充分利用 INT8 范围    │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+  简单说：权重不同输出通道的数值范围差异大时，per-tensor 会牺牲小通道，
+  per-channel 给每个通道独立的缩放系数，精度更高。
+
+
+二、数学原理 (简要)
+────────────────────────────────────────────────────────────────────────────────
+
+  Per-Tensor 量化:
+    W_int8[n,c] = round( W_fp32[n,c] / scale )     # 全局一个 scale
+
+  Per-Channel 量化:
+    W_int8[n,c] = round( W_fp32[n,c] / scale[c] )  # 每个通道 c 一个 scale
+
+    scale[c] = max(|W_fp32[:,c]|) / 127             # 通道 c 的绝对最大值
+
+  推理时反量化回去:
+    requant_output = sum( input_int8 * W_int8[n,c] * scale[c] )
+
+  硬件上把这个变成一次乘加:
+    multiplier[c] = scale[c] / output_scale        # 每个通道一个乘数
+    output = (sum * multiplier[c]) >> shift         # 统一右移
+
+  所有通道的 multiplier 需要对齐到同一个 shift 值（硬件约束），
+  所以: shift = max(各通道需要的 shift)
+        multiplier[c] = 原本的 multiplier[c] << (max_shift - shift[c])
+
+
+三、在 TPU-MLIR 中的完整流程
+────────────────────────────────────────────────────────────────────────────────
+
+  用户命令 (一行打开)
+  ────────────────────
+
+    model_deploy.py ... --matmul_perchannel
+
+
+  参数传递链
+  ─────────────────────────────────────────────────────────────
+
+  model_deploy.py            --matmul_perchannel 参数接收
+       │                          (python/tools/model_deploy.py:638)
+       ▼
+  mlir_shell.py             拼成 tpuc-opt 命令:
+       │                     "--convert-top-to-tpu=...matmul_perchannel=True..."
+       │                          (python/utils/mlir_shell.py:583-585)
+       ▼
+  TopToTpuPass.cpp          遍历所有算子, 给 MatMulOp 打上标记:
+       │                     op->setAttr("matmulPerchannelQuant", true)
+       │                          (lib/Conversion/TopToTpu/TopToTpuPass.cpp:1597-1614)
+       ▼
+  MatMul.cpp (BM1684X)      读到标记, 决定量化策略:
+       │                     - 读权重, 每个输出通道独立算 scale
+       │                     - 每个通道独立量化权重
+       │                     - 算多通道 multiplier, 对齐到公共 shift
+       │                          (lib/Conversion/TopToTpu/BM1684X/MatMul.cpp:40-306)
+       ▼
+  RequantIntAxis.cpp        生成 per-channel requant 权重张量:
+       │                     BM1684X: [N, 3] (multi, shift, zero_point)
+       │                     BM1688:  [N, 2] (multi, packed_shift_zp)
+       │                          (lib/Conversion/TopToTpu/BM1684X/RequantInt.cpp:66-107)
+       ▼
+  RequantIntAxis.cpp        后端参考实现: 按通道循环, 每通道读自己的
+  (Common)                  multi/shift/zero_point 做反量化计算
+       │                          (lib/Dialect/Tpu/Interfaces/Common/RequantIntAxis.cpp)
+       ▼
+  Param.h                   硬件参数结构体, is_perchannel=true
+                                  (include/tpu_mlir/Backend/BM168x/Param.h:779-798)
+       ▼
+  TPU 固件                  真正执行时按通道索引 multiplier, 逐个通道计算
+
+
+四、关键实现细节
+────────────────────────────────────────────────────────────────────────────────
+
+  1. 如何判断是 per-channel？
+
+     在 Top Dialect 层 (RequantInt.cpp:62):
+       如果 multiplier 数组大小 > 1，就是 per-channel
+       如果 multiplier 数组大小 = 1，就是 per-tensor
+
+  2. 量化轴是哪个？
+
+     对 MatMul 权重 [K, N]: axis=1，即输出通道方向
+     对 RequantIntOp: 通过 rq_axis 属性指定，一般也是输出通道
+
+  3. multiplier 对齐
+
+     per-tensor:  1 个 multiplier + 1 个 shift → 直接算
+     per-channel: N 个 multiplier → 需要对齐到同一个 shift
+       - 先各自算最合适的 (multiplier[n], shift[n])
+       - 取 max_shift = max(shift[n])
+       - 每个 multiplier[n] <<= (max_shift - shift[n])
+       - 检查不溢出 ( < 0x80000000 ), 溢出则收紧 shift 限制重试
+       代码在 MatMul.cpp:238-277
+
+  4. 算子融合
+
+     MatMul + Requant 可以融合为一个操作 (fuse_rq=true)。
+     融合后 multiplier/shift/zero_point 作为 MatMulOp 的一个 tensor 输入,
+     硬件一次完成乘加 + 反量化, 不需要额外的 requant 算子。
+     代码在 MatMul.cpp:296-306, 383-385
+
+  5. 不同芯片的参数打包方式
+
+     BM1684X: [N, 3]  → multiplier / shift / zero_point  各占一个 int32
+     BM1688:  [N, 2]  → multiplier / (shift|zero_point<<16)  后两个打包
+
+
+五、限制与适用场景
+────────────────────────────────────────────────────────────────────────────────
+
+  支持芯片:
+    仅 BM1684X / BM1688 / CV184X
+
+  支持精度模式:
+    仅 INT8 / UINT8 / W4INT8 (不是所有量化模式都支持)
+
+  支持算子:
+    仅 MatMulOp (含其变体)。Conv 目前没有 --matmul_perchannel 开关,
+    但 QAT 路径导入的 per-channel conv 权重可以通过 deploy_qat.py 处理
+
+  适用场景:
+    ✓ 大语言模型 (LLM)          — 权重矩阵各通道差异大, 收益明显
+    ✓ Transformer 模型          — Attention 中的 MatMul
+    ✓ 任意含大量 MatMul 的模型
+    ✗ 纯卷积网络 (ResNet 等)    — 主要算子是 Conv, MatMul 很少
+
+
+六、Per-Channel 的两种来源
+────────────────────────────────────────────────────────────────────────────────
+
+  来源 A — 自动生成 (PTQ 路径, 本文重点)
+  ────────────────────────────────────────
+
+    用户只需加 --matmul_perchannel, 工具链在 lowering 阶段自动:
+      1) 读 FP32 权重
+      2) 每个通道独立计算 scale = max(|channel|) / 127
+      3) 每个通道独立量化
+      4) 生成 per-channel multiplier 张量
+
+  来源 B — 外部导入 (QAT 路径)
+  ────────────────────────────────
+
+    训练框架 (PyTorch/TF) 已经做了 per-channel 伪量化, 导出 ONNX 时带了
+    每个通道的 scale/zero_point。deploy_qat.py 解析这些信息并转为 TPU 格式:
+
+    识别的 per-channel 伪量化算子 (deploy_qat.py:11-13):
+      - FakeQuantizeLearnablePerchannelAffine
+      - FixedPerChannelAffine
+      - FakeQuantizeDSQPerchannel
+      - FPEmuOp_per_channel
+
+
+七、与 SmoothQuant 中 Per-Channel 的关系
+────────────────────────────────────────────────────────────────────────────────
+
+  SmoothQuant 在校准阶段用到了 per-channel 量化来模拟权重误差
+  (smoothquant.py:20-27):
+
+  def qdq_weight(W, perchannel=True):
+      if perchannel:
+          mxw = np.abs(W).max(axis=1)     # 每通道独立的 max
+      else:
+          mxw = np.abs(W).max()            # 全局 max
+      s = mxw / 127
+      qdqW = clip(round(W/s), -127, 127) * s
+
+  目的不是生成 per-channel 的 bmodel, 而是用 per-channel 的方式更准确地
+  模拟量化误差, 从而算出更合理的 smooth scale, 让最终的 per-tensor INT8
+  模型精度更好。可以理解为 "用 per-channel 来辅助 per-tensor"。
+
+
+八、实操指引
+────────────────────────────────────────────────────────────────────────────────
+
+  完整命令 (第 1~2 步同纯 INT8, 第 3 步加一个参数):
+
+  # 1) 模型转换
+  model_transform.py \
+      --model_name resnet18 \
+      --model_def resnet18-v1-7.onnx \
+      --input_shapes [[1,3,224,224]] \
+      --resize_dims 256,256 \
+      --mean 123.675,116.28,103.53 \
+      --scale 0.0171,0.0175,0.0174 \
+      --pixel_format rgb \
+      --mlir resnet18.mlir
+
+  # 2) 校准 (同纯 INT8)
+  run_calibration.py resnet18.mlir \
+      --dataset ../../regression/dataset/ILSVRC2012 \
+      --input_num 100 \
+      --cali_method kl \
+      --chip bm1684x \
+      -o resnet18_cali_table
+
+  # 3) 部署 (加 --matmul_perchannel)
+  model_deploy.py \
+      --mlir resnet18.mlir \
+      --chip bm1684x \
+      --quantize INT8 \
+      --calibration_table resnet18_cali_table \
+      --matmul_perchannel \
+      --model resnet18_int8_perch.bmodel
+
+  跟纯 INT8 唯一的区别就是 deploy 时多一个 --matmul_perchannel。
+
+  对于 ResNet18: 里面的 MatMul 通常是最后的 FC 分类层, 只有一层,
+  per-channel 收益有限。对 LLM 收益大得多。
+
+
+九、关键文件索引
+────────────────────────────────────────────────────────────────────────────────
+
+  层次          | 文件                                         | 作用
+  ──────────────┼──────────────────────────────────────────────┼────────────────
+  用户入口      | python/tools/model_deploy.py:638              | --matmul_perchannel 参数
+  命令拼装      | python/utils/mlir_shell.py:583-585            | 传递给 tpuc-opt
+  标记算子      | lib/Conversion/TopToTpu/TopToTpuPass.cpp:1597 | 给 MatMulOp 打标记
+  量化核心      | lib/Conversion/TopToTpu/BM1684X/MatMul.cpp:40 | channel-wise scale 计算
+  参数对齐      | lib/Conversion/TopToTpu/BM1684X/MatMul.cpp:238 | multiplier 对齐算法
+  转换分发      | lib/Conversion/TopToTpu/BM1684X/RequantInt.cpp | per-tensor vs axis 分流
+  Top Dialect   | lib/Dialect/Top/Interfaces/RequantInt.cpp:62   | 判断 per_channel
+  Common 参考   | lib/Dialect/Tpu/Interfaces/Common/RequantIntAxis.cpp | CPU 参考实现
+  BM1684X 后端  | lib/Dialect/Tpu/Interfaces/BM1684X/RequantIntAxis.cpp | 硬件 codegen
+  硬件参数      | include/tpu_mlir/Backend/BM168x/Param.h:779    | is_perchannel 结构体
+  QAT 导入      | python/tools/deploy_qat.py:11                  | per-channel 伪量化算子
+  SmoothQuant   | python/calibration/smoothquant.py:20           | qdq_weight per-channel
+
+================================================================================

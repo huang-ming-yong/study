@@ -1,0 +1,345 @@
+================================================================================
+  TPU-MLIR  混合精度 详解
+================================================================================
+
+一、先有个直观感受
+────────────────────────────────────────────────────────────────────────────────
+
+  量化就像拍照时压缩 JPEG。
+
+  Per-Tensor INT8:  整张图统一用低画质 → 大部分区域还行, 但细节部分糊了
+  Per-Channel:      每通道独立压缩 → 颜色保留得更好, 但纹理还是有损
+  混合精度:         主体用低画质, 细节部分保留高画质 → 又快又好
+
+  假如模型有 50 层：
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                 │
+  │  全 INT8:    ██████████████████████████████████████████████████  │
+  │              (全部 50 层 INT8, 最快但精度损失)                     │
+  │                                                                 │
+  │  混合精度:   ████ F16 ███████████████ F16 █████████████████████  │
+  │              (3 层敏感层用 F16, 其余 47 层 INT8)                  │
+  │              (精度接近 F16, 速度接近 INT8)                        │
+  │                                                                 │
+  │  全 F16:     ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  │
+  │              (全部 50 层 F16, 最慢但精度最好)                      │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+  核心思想：不是所有层对量化一样敏感。找到少数几层最敏感的，
+  让它们保留浮点精度，其余大部分层走 INT8，以最小的性能代价换取最大的精度提升。
+
+
+二、为什么有些层更敏感？
+────────────────────────────────────────────────────────────────────────────────
+
+  不同层对量化误差的容忍度不同：
+
+  敏感层特征:                         不敏感层特征:
+  - 权重分布有极端离群值               - 权重分布均匀
+  - 激活值方差大                       - 激活值范围集中
+  - 该层的误差会逐层放大                - 该层的误差被后续层吸收
+  - 处于网络的"瓶颈"位置                - 处于网络的"冗余"位置
+
+  典型敏感层:
+    ✓ Softmax 前后                     ✓ 网络的输入/输出层
+    ✓ Attention 层                     ✓ 某些 Conv3x3 层
+    ✓ MatMul 矩阵乘法                  ✓ SE (Squeeze-Excitation) 模块
+    ✓ 残差连接的汇合点
+
+
+三、搜索算法：怎么找到敏感层
+────────────────────────────────────────────────────────────────────────────────
+
+  核心指标：余弦相似度 (Cosine Similarity)
+
+  cos(a, b) = a·b / (|a| × |b|)
+
+  量化后输出 vs FP32 输出, cos 越接近 1.0 说明越"像"。
+  cos < 0.99 → 该层被量化"破坏"了 → 敏感层
+
+  搜索流程 (MixPrecSearcher.run, mix_precision.py:1051):
+
+  ┌─────────────────────────────────────────────────────────┐
+  │                                                         │
+  │  1) 跑全 FP32 模型                                       │
+  │     → 记录每一层的输出作为"标准答案"                         │
+  │     → 记录全局输出作为"最终标准答案"                         │
+  │                                                         │
+  │  2) 跑全 INT8 模型                                       │
+  │     → 算全局 cos: INT8 输出 vs FP32 输出                   │
+  │     → 如果已经 ≥ expected_cos，直接结束，不需要混合精度       │
+  │     → 如果不够，进入第 3 步                                │
+  │                                                         │
+  │  3) 逐层扫描 + 动态提升 (search_mix_layer, :920)           │
+  │     for 每一层 (按拓扑顺序):                                │
+  │       a) 算该层 INT8 输出的 cos                            │
+  │       b) 如果 cos < min_layer_cos:                        │
+  │          → 将该层标记为敏感层                               │
+  │          → 切换到 F16 精度                                 │
+  │          → 重新降级模型 (MixQuantModel)                    │
+  │          → 重新跑一遍, 算全局 cos                           │
+  │       c) 如果全局 cos ≥ expected_cos: 停止！               │
+  │       d) 如果敏感层数 ≥ max_float_layers: 停止！            │
+  │       e) 如果切了 F16 反而更差: 撤销, 继续扫                │
+  │                                                         │
+  │  4) 输出结果                                              │
+  │     → qtable: 哪些层用 F16                                │
+  │     → loss_table: 所有层的 cos 排名                        │
+  │                                                         │
+  └─────────────────────────────────────────────────────────┘
+
+  为什么逐层扫而不是一次全切？
+
+  因为各层之间有依赖关系。把 layer_3 切 F16, 会影响 layer_5 的输入,
+  layer_5 的误差可能会变小（不再需要同时处理 layer_3 的量化噪声）。
+  必须每切一层就重新评估一次。
+
+  还有一个反直觉的情况：
+
+  某层 cos < 0.99 → 切 F16 → 全局 cos 反而下降了！
+  这是因为 INT8 和 F16 之间的数值精度不匹配, 引入了新的误差。
+  算法会检测这种情况并撤销操作 (:1003-1013)。
+
+
+四、qtable：混合精度的配置文件
+────────────────────────────────────────────────────────────────────────────────
+
+  qtable 就是一个文本文件, 告诉 deploy 工具哪些层不用默认精度。
+
+  格式 (QuantizeTable.dump, utils.py:298):
+
+  # generated time: 2026-07-26 20:00:00
+  # sample number: 30
+  # chip: BM1684X  mix_mode: F16
+  # total layers: 3
+  ###
+  # op_name   quantize_mode
+  # pattern layers
+  resnetv15_stage1_relu0_fwd_Relu F16
+  # shape layers
+  # custom layers
+  resnetv15_stage4_conv1_fwd_Conv F16
+  resnetv15_stage4_conv2_fwd_Conv F16
+
+  三个层级 (优先级: custom > shape > pattern):
+
+  shape layers    — 形状计算 op (Reshape, Slice, Tile 等), 自动标记 F16
+  pattern layers  — Transformer 模式匹配到的 op, 自动标记 F16
+  custom layers   — 搜索算法找到的敏感层, 手动标记的层
+
+  deploy 时逻辑:
+
+  for 每一层 in 模型:
+      if 层名在 qtable 的 custom_layers 中:  用 F16
+      elif 层名在 qtable 的 pattern_layers 中: 用 F16
+      elif 层名在 qtable 的 shape_layers 中:  用 F16
+      else: 用默认精度 (INT8)
+
+
+五、四种混合精度模式
+────────────────────────────────────────────────────────────────────────────────
+
+  --mix_mode 参数决定低精度和高精度分别用什么:
+
+  ┌─────────────────┬──────────┬───────────────┬──────────────────────┐
+  │ --mix_mode      │ 低精度   │ 高精度        │ 适用场景             │
+  ├─────────────────┼──────────┼───────────────┼──────────────────────┤
+  │ wi8ai8_fp       │ INT8     │ F16/BF16/F32  │ 通用 INT8 量化优化   │
+  │ wi4ai4_wi8ai8   │ INT4     │ INT8          │ 4bit 为主, 精度兜底  │
+  │ wi4ai8_wi8ai8   │ W4INT8   │ INT8          │ 仅权重 4bit, 激活 8bit│
+  │ wf8af8_fp       │ F8E4M3   │ F16/BF16/F32  │ FP8 为主, 敏感层 F16  │
+  └─────────────────┴──────────┴───────────────┴──────────────────────┘
+
+  wi8ai8_fp 是最常用的模式:
+    - 主体: INT8 (高吞吐, 低功耗)
+    - 敏感层: F16 (高精度)
+    - --fp_type 控制高精度用 F16/BF16/F32 哪种
+
+  get_mix_prec() 函数 (utils.py:447):
+    输入 chip + mix_mode + fp_type → 输出 (low_prec, high_prec)
+    例: bm1684x + wi8ai8_fp + auto → ('INT8', 'F16')
+
+
+六、关键参数如何影响搜索结果
+────────────────────────────────────────────────────────────────────────────────
+
+  --expected_cos 0.99    目标余弦相似度
+    设得越高, 搜索越激进 → 更多层切 FP → 精度越高但速度越慢
+    设 0.999: 几乎想和 FP32 一样, 可能一半的层都切 FP
+    设 0.95:  容忍一定的误差, 可能只切 1-2 层
+    默认 0.99 是比较平衡的选择
+
+  --min_layer_cos 0.99   单层敏感度阈值
+    某层 cos 低于此值就被认为是敏感层
+    设得越低, 判为敏感的层越少 → 切 FP 的层越少
+    设 0.999: 几乎所有层都被判敏感
+    设 0.90:  只有极少数明显出问题的层才被标记
+
+  --max_float_layers 5   浮点层上限
+    硬性限制, 防止太多层切 FP 影响性能
+    实际上限 = min(总层数/4, 该参数)
+    对 20 层的 ResNet18, 实际最多 5 层
+
+  --fp_type F16          高精度浮点类型
+    F16:  BM1684X 上性能最好, 推荐
+    BF16: 动态范围更大, 适合有大激活值的模型
+    F32:  精度最高但最慢, 用于极端敏感的层
+
+  --input_num 30         搜索用样本数
+    太少了不可靠 (cos 估计不准), 太多了慢
+    30~50 是比较合理的范围
+
+
+七、具体代码流程 (从命令行到 qtable)
+────────────────────────────────────────────────────────────────────────────────
+
+  第 1 层: 命令行参数解析
+  ────────────────────────
+
+  run_calibration.py 组织搜索参数:
+    --search search_qtable → 创建 SearchQtable 对象 (:145)
+    --mix_mode wi8ai8_fp  → 调用 get_mix_prec() 得到 ('INT8', 'F16')
+    --calibration_table   → 输入已有的校准阈值
+
+
+  第 2 层: SearchQtable.run() (search_qtable.py:584)
+  ───────────────────────────────────────────────────
+
+  1. 生成多种方法的阈值 (KL, MSE, Max, Percentile9999)
+     calibrator.gen_multiple_thresholds() → layer_th_dicts
+
+  2. 跑全 FP32 和全 INT8, 得到 baseline cos
+     float_model = MixQuantModel(mlir, None, "F32")  → 跑一遍, 记录输出
+     int8_model  = MixQuantModel(mlir, chip, 'INT8', 'F16') → 跑一遍, 算 cos
+     如果 int8 cos ≥ expected_cos → 直接结束, 不需要混合精度
+
+  3. 调用 MixPrecSearcher.run() 做逐层搜索
+
+
+  第 3 层: MixPrecSearcher.run() (mix_precision.py:1051)
+  ───────────────────────────────────────────────────────
+
+  与第 2 层类似, 重新跑 FP32/INT8 确认 baseline:
+    float_model → 记录每层 FP32 输出到 ref_activations
+    int8_model  → 算 all_int8_cos
+    如果 all_int8_cos ≥ expected_cos → 结束
+
+  否则调用 search_mix_layer() 逐层扫描
+
+
+  第 4 层: search_mix_layer() (mix_precision.py:920)
+  ────────────────────────────────────────────────────
+
+  for op in 所有 op (按拓扑顺序):
+    跳过 Skip 类 op (Input, Reshape, Softmax, Permute 等)
+
+    从 float_model 获取该层的 FP32 输出
+    从 mix_model 获取该层的 INT8 输出
+    cal_avg_layer_cos() → 算平均 cos
+
+    if cos < min_layer_cos:
+      → set_mix_till_curr_layer() → 将该层及之前未切的层都标记为 F16
+      → 重新生成 mix_table, 重新构建 mix_model
+      → 重新推理, 算全局 cos
+      → 如果全局 cos > expected_cos: 成功停止
+      → 如果超出 max_float_layers: 失败停止
+      → 如果比 all_int8_cos 还差: 撤销这层
+
+  最终输出:
+    → qtable (敏感层列表)
+    → loss_table (所有层的 cos 排序)
+
+  代码位置:
+    cal_avg_layer_cos()    : mix_precision.py:787
+    set_mix_till_curr_layer(): mix_precision.py:880
+    _gen_mix_table()        : mix_precision.py:284
+    print_log_info()        : mix_precision.py:1027
+
+
+  第 5 层: MixQuantModel (mix_precision.py:57)
+  ──────────────────────────────────────────────
+
+  这是一个"可降级"的模型类。根据传入的 mix_table, 调用 mlir_lowering()
+  生成一个部分层 F16、部分层 INT8 的中间 MLIR, 然后加载运行:
+
+    mlir_lowering(fp32_mlir, quanted_mlir, mode, chip, 1, 1,
+                  calib_table, False, mix_table)
+
+    mix_table 里的层:  该层用 high_prec (F16)
+    其他层:             用 low_prec (INT8)
+
+
+八、不止一种搜索方式
+────────────────────────────────────────────────────────────────────────────────
+
+  search_qtable (默认, 推荐):
+    ✓ 最全面, 逐层扫描
+    ✓ 生成 loss_table, 能看到每层的 cos
+    ✗ 较慢, 每切一层都要重新降级+推理
+
+  fast_search:
+    ✓ 不做逐层重新降级, 用近似方法评估
+    ✓ 比 search_qtable 快很多
+    ✗ 精度略差于 search_qtable
+    代码: search_qtable.py:768 (run_fast)
+
+  mix_search:
+    ✓ search_threshold + search_qtable 联合搜索
+    ✓ 同时优化阈值方法 + 混合精度
+    代码: run_calibration.py:138-141
+
+  fp_forward.py (手动):
+    ✓ 用户自己指定哪些层用 FP
+    ✓ 不需要跑搜索, 适用于已知哪些层敏感
+    代码: python/tools/fp_forward.py
+
+
+九、实操指引 (resnet18)
+────────────────────────────────────────────────────────────────────────────────
+
+  第 1 步: 模型转换
+  model_transform.py --model_name resnet18 --model_def resnet18-v1-7.onnx \
+      --input_shapes [[1,3,224,224]] --resize_dims 256,256 \
+      --mean 123.675,116.28,103.53 --scale 0.0171,0.0175,0.0174 \
+      --pixel_format rgb --mlir resnet18.mlir
+
+  第 2 步: 校准 (生成 cali_table)
+  run_calibration.py resnet18.mlir \
+      --dataset ../../regression/dataset/ILSVRC2012 \
+      --input_num 100 --cali_method kl --chip bm1684x \
+      -o resnet18_cali_table
+
+  第 3 步: 搜索敏感层 (生成 qtable)
+  run_calibration.py resnet18.mlir \
+      --dataset ../../regression/dataset/ILSVRC2012 \
+      --input_num 30 --chip bm1684x \
+      --search search_qtable --mix_mode wi8ai8_fp --fp_type F16 \
+      --expected_cos 0.99 --min_layer_cos 0.99 --max_float_layers 5 \
+      --calibration_table resnet18_cali_table \
+      --quantize_table resnet18_qtable
+
+  第 4 步: 部署 (cali_table + qtable)
+  model_deploy.py --mlir resnet18.mlir --chip bm1684x --quantize INT8 \
+      --calibration_table resnet18_cali_table \
+      --quantize_table resnet18_qtable \
+      --model resnet18_int8_mix.bmodel
+
+
+十、关键文件索引
+────────────────────────────────────────────────────────────────────────────────
+
+  文件                                       | 作用
+  ──────────────────────────────────────────┼──────────────────────────────
+  python/tools/run_calibration.py:132-153    | --search 参数, 调度不同搜索
+  python/calibration/search_qtable.py:584    | SearchQtable.run() 搜索入口
+  python/calibration/mix_precision.py:1051   | MixPrecSearcher.run() 核心
+  python/calibration/mix_precision.py:920    | search_mix_layer() 逐层扫描
+  python/calibration/mix_precision.py:787    | cal_avg_layer_cos() 层余弦计算
+  python/calibration/mix_precision.py:284    | _gen_mix_table() 生成临时精度表
+  python/calibration/mix_precision.py:57     | MixQuantModel 混合精度模型
+  python/calibration/utils.py:266            | QuantizeTable qtable 读写
+  python/calibration/utils.py:447            | get_mix_prec() 精度模式映射
+  python/tools/fp_forward.py                 | 手动标记 FP 层
+
+================================================================================
