@@ -1,0 +1,612 @@
+================================================================================
+            LayerGroup Pass —— Local Memory 地址分配流程说明
+================================================================================
+
+本文档承接《分配时间步.txt》，描述时间步分配完成后，如何为每个 buffer 在 LMEM
+中分配具体地址。内容涵盖 BM1684X 硬件架构、conflict 跟踪机制、贪心分配算法、
+bank conflict 规避策略。
+
+
+一、背景：时间步有了，地址怎么分？
+--------------------------------------------------------------------------------
+
+《分配时间步.txt》的最终输出是 timestep_table_：一张表，描述了每个时间步（TS）
+内 BDC 算什么、GDMA 搬什么。但这只解决了"时序"问题——每个 buffer 在哪个 TS 产
+生、在哪个 TS 消亡。
+
+接下来要解决"空间"问题：这些 buffer 放在 LMEM 的哪个物理地址？
+
+约束条件：
+  1. 时间上重叠的 buffer 地址不能冲突（不能占用同一块空间）
+  2. 同一 TS 内 GDMA 和 BDC 访问的 buffer 不能共享同一个 bank（bank conflict）
+  3. LMEM 总容量极小（BM1684X 每个 NPU 仅 256KB），必须精打细算
+
+核心目标：把所有 buffer 塞进 256KB，且 buffer 之间的 bank conflict 尽可能少。
+
+
+二、硬件基础：BM1684X 的 LMEM 结构
+--------------------------------------------------------------------------------
+
+  ┌──────────┬─────────┬────────────────────────────────────────────┐
+  │ 参数     │ 值       │ 说明                                       │
+  ├──────────┼─────────┼────────────────────────────────────────────┤
+  │ NPU_NUM  │ 64      │ 64 个 NPU 计算核心，每个有独立 LMEM         │
+  ├──────────┼─────────┼────────────────────────────────────────────┤
+  │ LMEM     │ 256 KB  │ 每个 NPU 的片上本地内存总量                  │
+  ├──────────┼─────────┼────────────────────────────────────────────┤
+  │ BANKS    │ 16      │ LMEM 被均匀划分为 16 个 bank                │
+  ├──────────┼─────────┼────────────────────────────────────────────┤
+  │ BANK_SIZE│ 16 KB   │ 每个 bank = 256KB ÷ 16                      │
+  └──────────┴─────────┴────────────────────────────────────────────┘
+
+LMEM 物理布局：
+
+  bank 0   bank 1   bank 2                    bank 15
+  ├───────┼───────┼───────┼ · · · ┼───────┤
+  │ 16KB  │ 16KB  │ 16KB  │       │ 16KB  │
+  └───────┴───────┴───────┴───────┴───────┘
+  │←────────────── 256KB ──────────────────→│
+
+每个 bank 每个周期只能服务一次访问。BDC（计算引擎）和 GDMA（搬运引擎）共享
+同一条总线通往 LMEM。
+
+源码定义：[BM1684X.h:107-117](include/tpu_mlir/Backend/BM168x/BM1684X.h#L107)
+
+
+三、Buffer 的三种类型
+--------------------------------------------------------------------------------
+
+  ┌────────────────┬─────────────────────────────────────────────────┐
+  │ 类型            │ 说明                                            │
+  ├────────────────┼─────────────────────────────────────────────────┤
+  │ LMEM_ACTIVATION │ 激活值（输入/输出特征图），占 LMEM 空间的大头     │
+  ├────────────────┼─────────────────────────────────────────────────┤
+  │ LMEM_WEIGHT     │ 权重 tensor，可切分的随 slice 加载，不可切分的    │
+  │                 │ 常驻 LMEM（hold_in_lmem）                        │
+  ├────────────────┼─────────────────────────────────────────────────┤
+  │ LMEM_OPERATION  │ 算子执行需要的临时 buffer（如 im2col 的列缓冲），  │
+  │                 │ 由每个算子的 getBufferSize() 接口报告所需大小      │
+  └────────────────┴─────────────────────────────────────────────────┘
+
+每个 buffer 的关键属性：
+
+  buffer_key   = {type, value, op}       // 唯一标识
+  buffer_value = {start_ts, end_ts,      // 生命期（在哪些 TS 存活）
+                  addr, size}            // 分配结果（地址 + 大小）
+
+源码定义：[LayerGroupDefs.h:96-124](include/tpu_mlir/Dialect/Tpu/Transforms/LayerGroup/LayerGroupDefs.h#L96)
+
+
+四、整体流程概览
+--------------------------------------------------------------------------------
+
+LMEM 地址分配是 LmemAllocator::assignLmemAddr() 的核心任务。完整调用链：
+
+  LmemAllocator::assignLmemAddrWithSecs()   // 外层：尝试多个 shape_secs 方案
+    → time_step->assignTimeStep()           // 重新分配时间步（每个方案不同切分）
+    → LmemAllocator::assignLmemAddr()       // ★ 核心：分配 LMEM 地址
+        ├── time_step->update_all_mem_buffer_size()  // ① 算每个 buffer 大小
+        ├── init_membuf_list()                       // ② 初始化待分配列表
+        ├── membuf_heap_create()                     // ③ 建 NPU/GDMA 冲突堆
+        ├── init_buffer_avail_space()                // ④ 初始化可用空间
+        ├── while (membuf_list 非空)                  // ⑤ 主分配循环
+        │     ├── update_membuf_conflict_param()     //   更新 conflict 标记
+        │     ├── membuf_list.sort()                 //   排序
+        │     ├── 遍历：global_find_avail_lmem_...   //   算候选地址
+        │     ├── 选地址最小者 → set_lmem_addr()      //   分配赢家
+        │     └── conflict_heap_delete()             //   删除赢家，清理堆
+        └── set_lmem_occupy()                        // ⑥ 记录 LMEM 总占用
+
+注意：外层 assignLmemAddrWithSecs 会遍历多种 shape_secs 切分方案，对每个方案
+重新做时间步分配 + LMEM 分配 + 周期计算，选 cost 最小的方案作为最终结果。
+本文聚焦内层 assignLmemAddr 的地址分配逻辑。
+
+源码位置：[LmemAllocator.cpp:993-1350](lib/Dialect/Tpu/Transforms/LayerGroup/LmemAllocator.cpp#L993)
+
+
+五、核心数据结构：冲突堆（Conflict Heap）
+--------------------------------------------------------------------------------
+
+5.1 为什么要建堆？
+
+地址分配是一个"逐步淘汰"的过程。每分配一个 buffer，需要知道还剩哪些 buffer
+之间有竞争关系。冲突堆就是跟踪这种"剩余竞争关系"的数据结构。
+
+5.2 堆的结构
+
+  npu_membuf_heap[ts]  = { 在 TS ts 被 BDC 计算用到的、尚未分配的 buffer }
+  gdma_membuf_heap[ts] = { 在 TS ts 被 GDMA 搬运涉及的、尚未分配的 buffer }
+
+两个数组长度都等于 timestep_num，每个元素是一个 set<buffer指针>。
+
+5.3 三个操作函数
+
+  ┌────────────────────────────┬──────────────────────────────────────┐
+  │ 函数                        │ 作用                                 │
+  ├────────────────────────────┼──────────────────────────────────────┤
+  │ membuf_heap_create()        │ 扫描 timestep_table，初始化两个堆。    │
+  │ [LmemAllocator.cpp:739]     │ npu_heap[ts] = TS ts 的 BDC 所涉      │
+  │                             │ buffer；gdma_heap[ts] = TS ts 的       │
+  │                             │ GDMA LOAD/STORE 所涉 buffer            │
+  ├────────────────────────────┼──────────────────────────────────────┤
+  │ update_membuf_conflict_     │ 遍历两个堆中所有元素，将其中出现的       │
+  │ param()                     │ buffer 的 conflict 标记设为 1。         │
+  │ [LmemAllocator.cpp:817]     │ 堆里没有的 → conflict = 0               │
+  ├────────────────────────────┼──────────────────────────────────────┤
+  │ conflict_heap_delete()      │ 将一个已分配 buffer 从所有堆中删除。     │
+  │ [LmemAllocator.cpp:838]     │ 清理规则：                              │
+  │                             │  · npu_heap[ts] 为空但 gdma 非空        │
+  │                             │    → 清空 gdma_heap[ts]                 │
+  │                             │  · gdma_heap[ts] 为空且 npu 只剩 1 个   │
+  │                             │    → 清空 npu_heap[ts]（只有一个无冲突） │
+  └────────────────────────────┴──────────────────────────────────────┘
+
+5.4 conflict 的含义
+
+  conflict = 1  →  至少一个 TS 里，还有别的未分配 buffer 和我共存
+                    → 分配时需要考虑别人占用的空间，比较难放
+                    → 排序时优先级高，先分配
+
+  conflict = 0  →  我占的 TS 里只剩我自己了
+                    → 没有对手，随便找空位塞
+                    → 排序时优先级低，后分配
+
+
+六、主分配循环
+--------------------------------------------------------------------------------
+
+6.1 循环结构
+
+  while (membuf_list 非空) {
+
+    // ─── 步骤 1：更新冲突 ───
+    update_membuf_conflict_param(npu_heap, gdma_heap, membuf_list);
+
+    // ─── 步骤 2：排序 ───
+    membuf_list.sort(conflict↓ → area↓ → start_ts↑ → idx↑);
+
+    // ─── 步骤 3：遍历，给每个 buffer 算候选地址 ───
+    for (每个 buffer) {
+        candidate = global_find_avail_lmem_localtion(buffer);
+        //             ↑ 内部三个子步骤：
+        //               ① update_exclude_banks() → 规避 bank conflict
+        //               ② update_avail_lmems()   → 扣除已占空间
+        //               ③ find_avail_lmem_location() → 找最低够大的空闲块
+        if (candidate.地址 < 当前最小地址) {
+            更新赢家 = 当前 buffer;
+        }
+    }
+
+    // ─── 步骤 4：分配赢家 ───
+    set_lmem_addr(赢家, 地址);
+
+    // ─── 步骤 5：清理 ───
+    conflict_heap_delete(赢家);     // 从堆删除
+    membuf_list.erase(赢家);        // 从待分配列表删除
+  }
+
+6.2 排序规则（决定了本轮遍历顺序，同时也是地址相同时的 tiebreaker）
+
+  优先级 1 — conflict 大的在前     （有对手的难放，优先处理）
+  优先级 2 — area 大的在前         （占时空多的难放，优先处理）
+  优先级 3 — start_ts 小的在前     （出现早的优先处理）
+  优先级 4 — idx 小的在前          （稳定排序兜底）
+
+  源码：[LmemAllocator.cpp:29-48](lib/Dialect/Tpu/Transforms/LayerGroup/LmemAllocator.cpp#L29)
+
+6.3 地址选择规则（决定了本轮到底分配谁）
+
+  优先级 1 — 候选地址最小的 buffer       （往低处塞，减少碎片）
+  优先级 2 — 地址相同时，conflict = 1    （有冲突的先安置）
+  优先级 3 — 同上，area 更大             （占空间大的先安置）
+  优先级 4 — 同上，start_ts 更早         （活得更早的先安置）
+
+  关键理解：规则 2~4 没有显式的 if-else 代码，而是利用排序结果隐式实现。
+  排序把 conflict 大/area 大/start_ts 早的排在前面遍历，当地址相同时，
+  先遍历到的自然被保留为赢家。
+
+
+七、候选地址如何计算
+--------------------------------------------------------------------------------
+
+为 buffer X 计算候选地址，需要回答：以 LMEM 当前状态，X 最低能放到哪个地址？
+
+计算过程：
+
+  1. 从整块 LMEM [0, 256KB) 开始
+  2. 遍历所有已分配 buffer：
+       如果该 buffer 和 X 时间重叠 →
+         从空闲列表中挖掉该 buffer 占的地址空间
+       如果该 buffer 和 X 同一 TS 且存在 GDMA vs BDC bank conflict →
+         把该 buffer 占的 bank 加入 X 的 exclude_banks
+  3. 从空闲列表中踢掉 exclude_banks 对应的 bank 空间
+  4. 从剩余空闲块中删掉不够 X 大小的碎片
+  5. 取第一个（地址最低的）剩余空闲块 → 候选地址
+
+空闲列表的维护（[LmemAllocator.cpp:239-304](lib/Dialect/Tpu/Transforms/LayerGroup/LmemAllocator.cpp#L239)）：
+
+  当从空闲列表中挖掉一段已占区间 [E_start, E_end) 时，与现有空闲块
+  [A_start, A_end) 存在四种重叠情况：
+
+    Case 1 — 完全覆盖：               Case 2 — 右侧重叠：
+      avail:  |--------|                avail:  |--------|
+      excl:  |------------|              excl:      |--------|
+      结果:   (删除)                     结果:   |---|
+
+    Case 3 — 左侧重叠：               Case 4 — 中间切分：
+      avail:      |--------|            avail:  |--------------|
+      excl:   |-------|                 excl:       |-----|
+      结果:          |---|              结果:   |---|     |---|
+
+
+八、Bank Conflict 规避
+--------------------------------------------------------------------------------
+
+8.1 什么是 Bank Conflict？
+
+同一 TS 内，BDC 在算、GDMA 在搬——两者同时访问 LMEM。如果它们访问的 buffer
+落在同一个 bank，就会产生 bank conflict：总线打架，硬件无法同时处理。
+
+  正确：                              冲突：
+  BDC 读 bank 3 ──┐                  BDC 读 bank 5 ──┐
+  GDMA 写 bank 7 ──┤ 并行 ✓           GDMA 写 bank 5 ──┤ 冲突 ✗
+                  │                                  │
+
+8.2 两种冲突的不同处理
+
+  ┌──────────────────┬──────────┬────────────────────────────────────┐
+  │ 冲突类型          │ 严重程度  │ 分配器处理                          │
+  ├──────────────────┼──────────┼────────────────────────────────────┤
+  │ BDC vs BDC       │ 可容忍    │ allow_bank_conflict = true           │
+  │ （计算内部）       │          │ 硬件串行化处理，分配器不规避          │
+  ├──────────────────┼──────────┼────────────────────────────────────┤
+  │ GDMA vs BDC      │ 硬冲突    │ 必须规避                            │
+  │ （搬运 vs 计算）   │          │ 通过 exclude_banks 机制绕开冲突 bank │
+  └──────────────────┴──────────┴────────────────────────────────────┘
+
+8.3 exclude_banks 工作原理
+
+  update_exclude_banks()（[LmemAllocator.cpp:651](lib/Dialect/Tpu/Transforms/LayerGroup/LmemAllocator.cpp#L651)）：
+
+    对候选 buffer X，遍历其生命期的每个 TS：
+      如果 X 在该 TS 被 GDMA 使用，且已分配 buffer Y 被 BDC 使用
+        → 把 Y 占的 bank 加入 X 的 exclude_banks
+      如果 X 在该 TS 被 BDC 使用，且已分配 buffer Y 被 GDMA 使用
+        → 同理
+
+  find_avail_lmem_location() 中：
+    先过滤掉 exclude_banks 对应的 bank 空间
+    再从剩余空间中找满足大小要求的最低地址
+    如果过滤后找不到 → 回退到允许 bank conflict（allow_bank_conflict 模式）
+
+  发生 bank conflict 会"降低信任"——CycleCalculator 估算的周期变得不准。
+  编译器无法精确建模 bank conflict 带来的额外延迟，所以性能评估的可信度下降。
+  这就是分配器要尽量规避 GDMA vs BDC 冲突的原因。
+
+
+九、与时间步分配的衔接
+--------------------------------------------------------------------------------
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │                     时间步分配（分配时间步.txt）                 │
+  │                                                              │
+  │  shape_secs + lg_info                                        │
+  │       │                                                      │
+  │       ▼                                                      │
+  │  memory_aware_timestep_assignment()                          │
+  │    ├── layer_nearest + software_pipeline                     │
+  │    └── memory_aware 负载均衡                                  │
+  │       │                                                      │
+  │       ▼                                                      │
+  │  gen_hold_coeff() → gen_all_mem_buffer_ts()                  │
+  │       │                                                      │
+  │       输出：timestep_table_（时序）+ lmem_buffer_（生命期）     │
+  └──────────────────────────┬───────────────────────────────────┘
+                             │
+                             ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │                    地址分配（本文档）                           │
+  │                                                              │
+  │  update_all_mem_buffer_size()  ← 计算每个 buffer 大小         │
+  │       │                                                      │
+  │       ▼                                                      │
+  │  membuf_heap_create()  ← 建冲突堆                             │
+  │       │                                                      │
+  │       ▼                                                      │
+  │  主分配循环（贪心 + 启发式）                                    │
+  │    conflict → sort → 遍历 → 选地址最小 → 分配 → 删堆          │
+  │       │                                                      │
+  │       ▼                                                      │
+  │  输出：lmem_buffer_[key].addr（每个 buffer 的 LMEM 地址）      │
+  └──────────────────────────┬───────────────────────────────────┘
+                             │
+                             ▼
+                    LmemAllocator（给后续 CycleCalculator 用）
+
+
+十、关键约束与边界情况
+--------------------------------------------------------------------------------
+
+1. hold_in_lmem：不可切分的权重标记为常驻 LMEM，生命周期覆盖所有 TS
+2. inplace 计算：某些算子（如 Scale/Add/Reshape）可以在输入 buffer 的地址
+   上直接写输出，不额外分配空间（[LmemAllocator.cpp:320-364](lib/Dialect/Tpu/Transforms/LayerGroup/LmemAllocator.cpp#L320)）
+3. 分配失败：如果某个 buffer 找不到可用空间，当前 shape_secs 方案无效，
+   外层尝试下一个方案
+4. BM1684 特例：L2M 空间（LutOp 权重），不在 LMEM 里分配（BM1684X 不使用）
+5. 多核场景：每个 NPU 独立分配，地址空间互相隔离
+
+
+十一、一句话总结
+--------------------------------------------------------------------------------
+
+LMEM 地址分配是一种"贪心 + 启发式排序 + 冲突感知"的装箱算法：
+
+  冲突堆（conflict heap）跟踪剩余 buffer 之间的竞争关系；
+  排序规则（conflict → area → start_ts）决定遍历顺序；
+  地址最小优先规则决定每轮真正分配谁；
+  exclude_banks 机制规避 GDMA vs BDC 的 bank conflict。
+
+每一步都在"有限 256KB 空间内把所有 buffer 塞进去"和"让编译器性能评估可信"
+之间做权衡。
+
+
+================================================================================
+附录 A：完整分配过程走读示例
+================================================================================
+
+A.1 场景设定
+
+一个简化 Group，2 个 OP（Conv → Pool），经过 Software Pipeline 后的
+timestep 表（为演示方便，简化为 2 个 TS）：
+
+            TS 0          TS 1
+  BDC:      Conv         Pool
+  GDMA:     LOAD A       STORE C
+
+有 5 个 buffer 待分配：
+
+  buffer  存活时间      大小      说明
+  ──────  ────────────  ────────  ──────────────────────────
+    A     TS 0 ~ 0      4 KB     输入激活，TS0 LOAD进，TS0 Conv消费
+    W     TS 0 ~ 1      2 KB     卷积权重，全程常驻（hold_in_lmem）
+    X     TS 0 ~ 1      4 KB     Conv 输出，TS0 产生，TS1 Pool 消费
+    C     TS 1 ~ 1      4 KB     最终输出，TS1 Pool 产生，TS1 STORE 出
+    B     TS 0 ~ 0      2 KB     Conv 的 bias，TS0 加载，TS0 消费
+
+为演示方便，假设 LMEM 总容量 = 14 KB（而非真实的 256KB），
+且忽略 bank 划分（先把 bank conflict 放一边，聚焦冲突堆 + 地址分配）。
+
+A.2 时间线与重叠关系
+
+         TS 0     TS 1
+         ├────────┼────────┤
+  A:     ████│             │
+  W:     ████████████████████
+  X:     ████████████████│
+  C:            │████│
+  B:     ████│             │
+
+A.3 初始化
+
+Step 1: update_all_mem_buffer_size() → 确定每个 buffer 大小（见上表）
+
+Step 2: init_membuf_list() → 放入待分配列表，初始 conflict=0
+
+Step 3: membuf_heap_create() → 扫描 timestep 表建堆：
+
+  npu_heap[0]  = {A, W, X, B}    ← Conv 的输入(A,W,B) + 输出(X)
+  npu_heap[1]  = {W, X, C}       ← Pool 的输入(W,X) + 输出(C)
+  gdma_heap[0] = {A, B}          ← TS0 LOAD A 和 B
+  gdma_heap[1] = {C}             ← TS1 STORE C
+
+Step 4: init_buffer_avail_space() → 每个 buffer 初始 avail_lmems = [(0, 14KB)]
+
+A.4 主循环
+
+══════════════════════════════════════════════════════════
+第 1 轮
+══════════════════════════════════════════════════════════
+
+Step 1: update_membuf_conflict_param()
+  堆里有 A、W、X、B、C → 全部 conflict = 1
+
+Step 2: 排序（conflict全1 → 比 area）
+  area = (end_ts - start_ts + 1) × size
+  A: (0-0+1)×4 = 4     W: (1-0+1)×2 = 4
+  X: (1-0+1)×4 = 8     C: (1-1+1)×4 = 4     B: (0-0+1)×2 = 2
+
+  排序: X(8) → A(4,start=0) → W(4,start=0) → C(4,start=1) → B(2)
+
+Step 3: 遍历，算候选地址
+  已分配列表为空，所有 buffer 候选地址都是 0。
+  地址全相同 → 排序最前的 X 胜出。
+
+Step 4: 分配 X，地址 0，占 [0, 8KB)
+
+Step 5: conflict_heap_delete(X)
+  从所有堆删除 X：
+    npu_heap[0]  = {A, W, B}      ← X 被删
+    npu_heap[1]  = {W, C}         ← X 被删
+    gdma_heap[0] = {A, B}
+    gdma_heap[1] = {C}
+
+  检查清理：
+    TS 1 npu 剩 {W,C}（2个），gdma 剩 {C} → 不触发
+
+  当前 LMEM:  [0KB    8KB) 已占(X)    [8KB   14KB) 空闲
+
+══════════════════════════════════════════════════════════
+第 2 轮
+══════════════════════════════════════════════════════════
+
+Step 1: update_membuf_conflict_param()
+  堆里有 A、W、B、C → 全部 conflict = 1
+
+Step 2: 排序
+  A(4,start=0) → W(4,start=0) → C(4,start=1) → B(2)
+
+Step 3: 遍历，算候选地址
+  对每个 buffer，只扣除与之时间重叠的已分配 buffer (X, [0,8KB), TS0~1)。
+
+  A (TS 0~0): X 重叠 TS0 → 扣 [0,8KB)
+    avail = [(8KB, 6KB)] → 候选地址 = 8KB
+
+  W (TS 0~1): X 完全重叠 → 扣 [0,8KB)
+    avail = [(8KB, 6KB)] → 候选地址 = 8KB
+
+  C (TS 1~1): X 重叠 TS1 → 扣 [0,8KB)
+    avail = [(8KB, 6KB)] → 候选地址 = 8KB
+
+  B (TS 0~0): X 重叠 TS0 → 扣 [0,8KB)
+    avail = [(8KB, 6KB)] → 候选地址 = 8KB
+
+  全部候选 8KB → 排序最前 A 胜出。
+
+Step 4: 分配 A，地址 8KB，占 [8KB, 12KB)
+
+Step 5: conflict_heap_delete(A)
+  从所有堆删除 A：
+    npu_heap[0]  = {W, B}         ← A 被删
+    npu_heap[1]  = {W, C}
+    gdma_heap[0] = {B}            ← A 被删
+    gdma_heap[1] = {C}
+
+  检查清理：
+    TS 1 无变化 → 不触发
+
+  当前 LMEM:  [0KB    8KB) X    [8KB   12KB) A    [12KB   14KB) 空闲
+
+══════════════════════════════════════════════════════════
+第 3 轮
+══════════════════════════════════════════════════════════
+
+Step 1: update_membuf_conflict_param()
+  堆里有 W、B、C → 全部 conflict = 1
+
+Step 2: 排序
+  W(4,start=0) → C(4,start=1) → B(2)
+
+Step 3: 遍历，算候选地址
+  已分配: X([0,8KB),TS0~1), A([8KB,12KB),TS0~0)
+
+  W (TS 0~1): X 重叠 → 扣 [0,8KB)。A 重叠 TS0 → 扣 [8KB,12KB)
+    avail = [(12KB, 2KB)] → 候选地址 = 12KB
+
+  C (TS 1~1): X 重叠 TS1 → 扣 [0,8KB)。A 不重叠 TS1 → 不扣！
+    avail = [(8KB, 6KB)] → 候选地址 = 8KB  ← ★ 更小
+
+  B (TS 0~0): X 重叠 → 扣 [0,8KB)。A 重叠 → 扣 [8KB,12KB)
+    avail = [(12KB, 2KB)] → 候选地址 = 12KB
+
+  C 的候选地址 8KB 最小 → C 胜出！
+
+  注意：尽管 C 在排序中排第 2，但因为它的候选地址更低
+  （它只和 X 冲突，不和 A 冲突——C 活在 TS1，A 活在 TS0），
+  地址最小优先规则让 C 击败了排序更靠前的 W。
+
+Step 4: 分配 C，地址 8KB，占 [8KB, 12KB)
+  注意：C 和 A 地址完全重叠 [8KB, 12KB)，但它们时间不重叠
+  （A 在 TS0，C 在 TS1），这是合法的空间复用！
+
+Step 5: conflict_heap_delete(C)
+  从所有堆删除 C：
+    npu_heap[0]  = {W, B}
+    npu_heap[1]  = {W}            ← C 被删
+    gdma_heap[0] = {B}
+    gdma_heap[1] = {}             ← C 被删
+
+  检查清理：
+    TS 1 gdma 空了，npu 只剩 {W}（1个）→ 触发规则 B
+    → 清空 npu_heap[1] = {}
+
+  当前 LMEM:  [0,8KB) X    [8KB,12KB) A+C(时间错开)    [12KB,14KB) 空闲
+
+══════════════════════════════════════════════════════════
+第 4 轮
+══════════════════════════════════════════════════════════
+
+Step 1: update_membuf_conflict_param()
+  堆里: npu[0]={W,B}, npu[1]={}, gdma[0]={B}, gdma[1]={}
+  W 在 npu[0] → conflict = 1
+  B 在 npu[0] 和 gdma[0] → conflict = 1
+
+Step 2: 排序
+  W(4,start=0) → B(2)
+
+Step 3: 遍历，算候选地址
+  已分配: X([0,8KB),TS0~1), A([8KB,12KB),TS0~0), C([8KB,12KB),TS1~1)
+
+  W (TS 0~1): X 重叠 → 扣 [0,8KB)。A 重叠 TS0 → 扣 [8KB,12KB)
+             C 重叠 TS1 → 扣 [8KB,12KB)（同地址被扣一次）
+    avail = [(12KB, 2KB)] → 候选地址 = 12KB
+
+  B (TS 0~0): X 重叠 → 扣 [0,8KB)。A 重叠 TS0 → 扣 [8KB,12KB)
+             C 不重叠 TS0 → 不扣
+    avail = [(12KB, 2KB)] → 候选地址 = 12KB
+
+  都 12KB → W 胜出（排序靠前）。
+
+Step 4: 分配 W，地址 12KB，占 [12KB, 14KB)
+
+Step 5: conflict_heap_delete(W)
+  从所有堆删除 W：
+    npu_heap[0]  = {B}            ← W 被删
+    gdma_heap[0] = {B}
+
+  检查清理：
+    TS 0 npu 剩 {B}（1个），gdma 剩 {B}（非空）→ 不触发规则
+    （两个都是 B，但 rule 要求 gdma 为空才清理 npu）
+
+  当前 LMEM:  [0,8KB) X    [8KB,12KB) A+C    [12KB,14KB) W
+
+══════════════════════════════════════════════════════════
+第 5 轮（最后一轮）
+══════════════════════════════════════════════════════════
+
+Step 1: update_membuf_conflict_param()
+  B 还在 npu[0] 和 gdma[0] → conflict = 1
+
+Step 2: 排序
+  只剩 B，直接分配。
+
+Step 3: 遍历
+  已分配: X([0,8KB)), A([8KB,12KB)), C([8KB,12KB)), W([12KB,14KB))
+  B (TS 0~0): X 重叠 → 扣 [0,8KB)。A 重叠 → 扣 [8KB,12KB)
+             W 重叠 → 扣 [12KB,14KB)
+    avail = []  → 找不到空间！
+
+  这表示 LMEM 不够了 —— 在真实的 256KB 场景下一般不会出现，但此例子中
+  14KB 总空间已被占满。实际源码中会返回 false，上层尝试其他 shape_secs。
+
+  为完成演示，假设 LMEM 总空间调整为 16KB：
+    avail = [(14KB, 2KB)] → 候选地址 = 14KB
+
+Step 4: 分配 B，地址 14KB，占 [14KB, 16KB)
+
+A.5 最终分配结果
+
+  地址:    0        8       12      14   16
+          ├────────┼────────┼───────┼───┤
+  TS 0:   │   X    │   A    │   W   │ B │
+  TS 1:   │   X    │   C    │   W   │   │
+          └────────┴────────┴───────┴───┘
+
+  空间复用：
+    A (TS0) 和 C (TS1) 共享 [8KB, 12KB) — 时间错开，不冲突 ✓
+    W 和 B 各自独立空间
+
+A.6 关键观察
+
+  1. 地址最小优先的力量：第 3 轮中 C 排序第 2，但因为候选地址 8KB <
+     W 的 12KB，C 直接获胜。这体现了"地址最小优先"作为第一规则的威力。
+
+  2. conflict 的动态变化：随着 buffer 被分配、堆被清理，conflict 标记
+     动态更新。分配越到后期，堆越小，conflict=0 的 buffer 越多。
+
+  3. 空间复用：A 和 C 时间不重叠，共享同一块地址。这是 LMEM 分配的核心
+     价值 —— 通过时间维度的错开，让有限空间被多轮复用。
+
+  4. 贪心本质：每轮选"当前能放到最低地址的"buffer，不求全局最优，
+     但求可行 + 快速。
+
+================================================================================

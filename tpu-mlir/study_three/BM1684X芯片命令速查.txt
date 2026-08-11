@@ -1,0 +1,214 @@
+╔══════════════════════════════════════════════════════════════╗
+║         BM1684X 芯片服务器 — bmodel 推理命令速查            ║
+╚══════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. model_tool — 查看 bmodel 内部信息
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【作用】看模型输入/输出的 name、shape、dtype、芯片类型。
+       知道输入叫什么名字，后面 model_runner.py 才能正确喂数据。
+
+【用法】
+  model_tool --info resnet18_f16.bmodel
+
+【输出示例】
+  Chip: BM1684X
+  Input:
+    - data     : [1, 3, 224, 224]  float32       ← 记住这个名字 "data"
+  Output:
+    - output   : [1, 1000]  float32
+
+【其他用法】
+  model_tool --chip  resnet18_f16.bmodel        # 只看芯片类型
+  model_tool --print resnet18_f16.bmodel        # 看完整内部结构（很长）
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. 准备输入数据 — .npz 文件
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【作用】把图片转成 bmodel 需要的格式。
+       注意：bmodel 内部已固化预处理，这里只需转 float32，不用归一化。
+
+【用法 — 用 cat.jpg 生成输入】
+  python3 -c "
+from PIL import Image
+import numpy as np
+img = Image.open('cat.jpg').convert('RGB').resize((224,224))
+arr = np.array(img, dtype=np.float32) / 255.0
+mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+arr = (arr - mean) / std
+arr = np.expand_dims(arr.transpose(2,0,1), axis=0)
+np.savez('cat_fp.npz', data=arr)
+print('shape:', arr.shape, 'min:', arr.min(), 'max:', arr.max())
+"
+
+【为什么不用归一化？】
+  Python ONNX:  (pixel/255 - 0.485) / 0.229          ← 手动做
+  bmodel:       模型内部自动做 (pixel - 123.675) * 0.0171  ← 不用管
+  所以这里只转 float32，像素值保持 [0, 255]。
+
+【验证输入是否正确】
+  python3 -c "
+  import numpy as np
+  d = np.load('cat_fp.npz')
+  for k in d.keys():
+      arr = d[k]
+      print(f'{k}: shape={arr.shape}  dtype={arr.dtype}  range=[{arr.min():.0f}, {arr.max():.0f}]')
+  "
+  输出 range 应为 [0, 255]。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. model_runner.py — 在真实芯片上运行推理
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CPU端
+
+python3 -c "import numpy as np, onnxruntime as ort; inp=np.load('cat_fp1.npz'); d=inp[list(inp.keys())[0]]; sess=ort.InferenceSession('resnet18.onnx'); out=sess.run(None,{sess.get_inputs()[0].name:d}); np.savez('cat_cpu_out.npz',**{sess.get_outputs()[0].name:out[0]}); print('saved cat_cpu_out.npz')"
+
+
+
+
+【作用】加载 bmodel → 喂入 npz → 芯片推理 → 保存输出 npz。
+       这是最常用的推理命令。
+
+【用法】
+  model_runner.py \
+    --input  cat_fp.npz \
+    --model  resnet18_f16.bmodel \
+    --output cat_f16_out.npz
+
+  model_runner.py \
+    --input  cat_fp1.npz \
+    --model  resnet18_int8.bmodel \
+    --output cat_int8_out1.npz
+
+【参数说明】
+  --input  输入 npz 文件      key 名必须和 model_tool 看到的输入名一致
+  --model  要跑的 bmodel 文件
+  --output 输出 npz 文件      里面是模型的推理结果
+
+【查看输出 Top-5】
+  python3 -c "import numpy as np; out=np.load('cat_f16_out.npz'); arr=out[list(out.keys())[0]][0]; e=np.exp(arr-arr.max()); p=e/e.sum(); top5=np.argsort(arr)[::-1][:5]; lines=open('synset_words.txt').readlines(); [print(f'{i+1}. [{int(idx)}] {lines[int(idx)].strip()}  prob={p[int(idx)]*100:.2f}%') for i,idx in enumerate(top5)]"
+
+  "
+
+【前提】
+  必须先 source envsetup.sh && use_chip
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. bmrt_test — 快速验证 + 测延迟
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【作用】不依赖 Python 环境，直接加载 bmodel 用随机数据跑一次推理。
+       主要用于验证 bmodel 可用 + 获取推理延迟。
+
+【用法】
+  bmrt_test --bmodel resnet18_f16.bmodel
+
+【关键输出】
+  [show_net_info]  NetName: resnet18, Index=0
+    Input  0) 'data'   shape=[ 1 3 224 224 ]  dtype=FLOAT32
+    Output 0) 'output' shape=[ 1 1000 ]        dtype=FLOAT32
+  ─────────────────────────────────────────────
+  [bmrt_test] calculate time(s): 0.004132       ← ★ 单张推理延迟
+  [bmrt_test] load input time(s): 0.008914      ← 数据搬运（不计延迟）
+
+【注意事项】
+  - 用的输入是随机数，不是真实图片，所以输出无意义
+  - 只看 calculate time 即可
+  - 如果报 soft lockup / 卡死，先跑 sudo bm-smi recover 重置 TPU
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. bmrt_test --loopnum — 测吞吐量
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【作用】循环跑 N 次推理，用 总时间/N 算平均推理时间，再算吞吐。
+
+【用法】
+  bmrt_test --bmodel resnet18_f16.bmodel  --loopnum 1000
+
+【算吞吐】
+  吞吐 (img/s) = loopnum / 总时间(s)
+               = 1000 / (calculate time × 1000)
+               = 1 / calculate time
+
+  也就是单张延迟取倒数。
+
+【对比 F16 vs INT8】
+  bmrt_test --bmodel resnet18_f16.bmodel  2>&1 | grep "calculate time"
+  bmrt_test --bmodel resnet18_int8.bmodel 2>&1 | grep "calculate time"
+
+  预期：INT8 速度快约 2 倍，bmodel 文件小约 40%
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. bm-smi — 查看 TPU 状态
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【作用】类似 GPU 的 nvidia-smi，看芯片温度、功率、使用率。
+
+【用法】
+  bm-smi                          # 查看状态
+  sudo bm-smi recover             # TPU 卡死时重置恢复
+
+【输出示例】
+  Card 0 (BM1684X):
+    Temperature: 45°C
+    Power: 25W / 75W
+    Memory Used: 512MB / 16384MB
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                            速查表
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  做什么              │ 命令
+  ────────────────────┼─────────────────────────────────────
+  看模型输入输出信息   │ model_tool --info xxx.bmodel
+  生成图片输入 npz     │ python3 预处理脚本
+  芯片推理 (精度)      │ model_runner.py --input ... --model ... --output ...
+  测单张延迟           │ bmrt_test --bmodel xxx.bmodel
+  测吞吐               │ bmrt_test --bmodel xxx.bmodel --loopnum N
+  看 TPU 状态          │ bm-smi
+  TPU 重置             │ sudo bm-smi recover
+  看文件大小           │ ls -lh xxx.bmodel
+  精度对比             │ python3 加载两个 npz 算差值的 max/mean
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    常见问题排查
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ❌ bmrt_test: command not found
+     → libsophon 未安装或没加 PATH
+     → export PATH=/opt/sophon/libsophon-current/bin:$PATH
+
+  ❌ model_runner.py: command not found
+     → 没 source envsetup.sh
+     → source /path/to/tpu-mlir/envsetup.sh && use_chip
+
+  ❌ soft lockup / CPU stuck
+     → TPU 状态卡死
+     → sudo bm-smi recover
+
+  ❌ Cannot open /dev/bm*
+     → 没权限
+     → sudo chmod 666 /dev/bm*
+
+  ❌ shape mismatch
+     → npz 数据 shape 和模型不匹配
+     → model_tool --info 看正确 shape，调整 npz
+
+  ❌ key 不对，model_runner 找不到输入
+     → npz 保存时的 key 名和 model_tool 显示的输入名不一致
+     → 改成一致，比如 key='data'
+
+
+
+python3 -c "from PIL import Image ;import numpy as np;img = Image.open('cat.jpg').convert('RGB').resize((224,224));arr = np.array(img, dtype=np.float32);np.savez('cat_fp.npz', data=arr)"
+python3 -c "import numpy as np; d = np.load('cat_fp.npz');for k in d.keys():;arr = d[k];print(f'{k}: shape={arr.shape}  dtype={arr.dtype}  range=[{arr.min():.0f}, {arr.max():.0f}]') "

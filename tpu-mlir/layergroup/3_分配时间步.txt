@@ -1,0 +1,396 @@
+================================================================================
+             LayerGroup Pass —— 时间步分配与 Software Pipeline 流程说明
+================================================================================
+
+一、背景：为什么要做时间步分配与软件流水？
+--------------------------------------------------------------------------------
+
+在 TPU-MLIR 的 LayerGroup 优化中，编译器会将多个相邻的 OP 融合成一个 Group，
+让它们的中间数据留在片内内存（LMEM）中，避免频繁与片外内存（DDR/GMEM）交换数据。
+
+但 LMEM 容量有限（通常只有 16MB），一张特征图往往需要被切片（slice）成多块，
+分多次计算。每次循环处理一个 slice，需要三步：
+
+  LOAD   ：GDMA 把下一片输入数据从 GMEM 搬到 LMEM
+  COMPUTE ：BDC 在 LMEM 上做计算
+  STORE  ：GDMA 把结果从 LMEM 搬回 GMEM
+
+如果不做流水线，这三步完全串行，硬件利用率很低。时间步分配 + Software Pipeline
+的目的就是：让 GDMA 的数据搬运和 BDC 的计算最大程度重叠，最大化 TPU 硬件利用率。
+
+核心目标：整个 Group 的执行时间 = max(BDC 总周期, GDMA 总周期)，而不是两者之和。
+
+
+二、核心概念速查
+--------------------------------------------------------------------------------
+
+  ┌────────┬───────────────────┬──────────────────────────────────────────────┐
+  │ 术语   │ 全称 / 含义        │ 说明                                         │
+  ├────────┼───────────────────┼──────────────────────────────────────────────┤
+  │ BDC    │ Basic Data Compute│ TPU 的计算引擎（TIU），执行 conv/matmul/elt-  │
+  │        │                   │ ment-wise 等实际运算                          │
+  ├────────┼───────────────────┼──────────────────────────────────────────────┤
+  │ GDMA   │ General DMA       │ TPU 的数据搬运引擎，负责 GMEM ↔ LMEM 的数据    │
+  │        │                   │ 传输                                          │
+  ├────────┼───────────────────┼──────────────────────────────────────────────┤
+  │ TS     │ TimeStep          │ 时间片单位。一个 TS 内 BDC 和 GDMA 可以并行     │
+  │        │                   │ 执行，是调度的基本粒度                         │
+  ├────────┼───────────────────┼──────────────────────────────────────────────┤
+  │ Stage 0│ 填充期 (Filling)   │ 循环的"预热"阶段：只有 LOAD，BDC 还没开始计算   │
+  ├────────┼───────────────────┼──────────────────────────────────────────────┤
+  │ Stage 1│ 稳态期 (Kernel)    │ 循环的"主力"阶段：BDC 计算当前 slice 的同时，   │
+  │        │                   │ GDMA 并行加载下一个 slice 的数据               │
+  ├────────┼───────────────────┼──────────────────────────────────────────────┤
+  │ Stage 2│ 排空期 (Draining)  │ 循环的"收尾"阶段：最后一个 slice 算完后，       │
+  │        │                   │ 只需要 STORE，BDC 空闲                        │
+  ├────────┼───────────────────┼──────────────────────────────────────────────┤
+  │ swpipl │ Software Pipeline │ 软件流水线，指整个三级流水机制                  │
+  └────────┴───────────────────┴──────────────────────────────────────────────┘
+
+对应到 TPU-MLIR 源码：
+  - BasicTimeStep.cpp  ：timestep_table_ 的数据结构管理 + 软件流水入口
+  - TimeStepMethod.cpp ：具体的时间步分配算法（编排器）
+  - SwPipeline.cpp     ：3-Stage Software Pipeline 的具体实现
+
+
+三、整体流程概览
+--------------------------------------------------------------------------------
+
+时间步分配的完整流程（调用链）：
+
+  GroupMethod::is_layer_group_valid()
+    → time_step->assignTimeStep()
+      → TimeStepMethod::process()
+        → stripe_mine_idx_slice()            // 从输出反推每个 tensor 的切分
+        → update_tensor_infos()              // 设置 tensor 属性标记（mode/slice_info）
+        → memory_aware_timestep_assignment() // ★ 核心：时间步分配 + 优化（一个函数包了下面全部）
+        │   ├── layer_nearest_timestep_assignment()  // 最近邻分配
+        │   │     └── software_pipeline()            // 分配完立即做 3-Stage 软件流水
+        │   └── Memory Aware 优化                     // slack 计算 → get_best_ts → bubble 移动
+        → gen_hold_coeff()                   // 确定哪些 tensor 常驻 LMEM
+        → gen_all_mem_buffer_ts()            // 生成每个 buffer 的生命期（start_ts/end_ts）
+        → update_all_mem_buffer_size()       // 计算每个 buffer 的实际 LMEM 大小
+        → LmemAllocator                      // 根据生命期分配 LMEM 地址
+        → CycleCalculator                    // 模拟 Filling/Kernel/Draining 计算总周期
+
+注意：上述流程是概念逻辑上的逐步推进。在实际代码中，
+software_pipeline() 在 layer_nearest_timestep_assignment() 末尾被调用，
+而 memory_aware_timestep_assignment() 内部先调 layer_nearest（含 sw pipeline），
+再执行 slack 均衡优化。三者在概念上是"分配 → 流水 → 均衡"的递进关系，
+只是代码实现上将它们组织为嵌套调用而非平铺的三个独立步骤。
+
+
+四、Layer Nearest 时间步分配（核心算法）
+--------------------------------------------------------------------------------
+
+4.1 "最近邻"的含义
+
+Layer Nearest 是一种时序分配策略，核心三原则：
+
+  原则 1：每层 Layer 占用一个时间步（不合并 OP）
+  原则 2：Load 操作尽可能迟 —— 数据用到之前才加载，缩短 LMEM 占用时间
+  原则 3：Store 操作尽可能早 —— 数据算完立刻存出去，释放 LMEM
+
+名字中的"Nearest"就是指：加载紧邻在使用前、存储紧邻在产生后。
+
+4.2 分配逻辑（逐 OP 遍历）
+
+假设一个 Group 包含 N 个 OP：op[0] → op[1] → ... → op[N-1]
+
+  for i in 0..N-1:                          // 遍历每个算子
+    if i == 0:                              // 第一个算子 → Stage 0 雏形
+      [GDMA] Load(op[0].inputs)             // 先加载输入数据
+    else:
+      [BDC]  Compute(op[i-1])               // 计算上一个 OP
+      [GDMA] Load(op[i].inputs)             // 预加载当前 OP 需要的输入/权重
+      [GDMA] Store(op[i-2].outputs)         // 写出更早 OP 的输出（如果不再需要）
+    if i == N-1:                            // 最后一个算子 → Stage 2 雏形
+      [GDMA] Store(op[N-1].outputs)         // 写出最终结果
+
+用表格表示（以 4 个 OP 为例）：
+
+  TS 0:  BDC[空]          GDMA[Load op0输入]        ← 填充期：先搬数据
+  TS 1:  BDC[Compute op0] GDMA[Load op1权重]
+  TS 2:  BDC[Compute op1] GDMA[Load op2权重]
+  TS 3:  BDC[Compute op2] GDMA[Load op3权重]
+  TS 4:  BDC[Compute op3] GDMA[Load 下一轮数据]
+  TS 5:  BDC[空]          GDMA[Store 最终结果]       ← 排空期：最后写回
+
+4.3 理解 GDMA 为空的情况
+
+在上面的表格中，TS 2、TS 4 的 GDMA 可能为空。这不是 Bug，而是 LayerGroup
+fusion 的核心价值所在：
+
+  - OP 之间的中间数据直接留在 LMEM 里传递
+  - op0 的输出直接给 op1 用，不需要 GDMA 搬运
+  - 只有"从 DDR 首次加载"和"最终写回 DDR"才需要 GDMA
+
+这就是为什么 GDMA 在某些 TS 里"摸鱼"——BDC 的计算完全依赖 LMEM 内部已有数据。
+
+4.4 左侧图（Layer Nearest 基础分配）的问题
+
+Layer Nearest 虽然简单直观，但存在两个明显的"空转"：
+
+  问题 1 — 头部空转（TS 0）：
+    BDC 空转，因为必须先 LOAD 完第一批数据才能开始算
+
+  问题 2 — 尾部空转（TS 5）：
+    BDC 又空转，因为最后的结果必须 STORE 出去才算完成
+
+  总耗时 = BDC_cycle + GDMA_cycle（串行相加），利用率低。
+
+
+五、Software Pipeline 优化（三级流水线）
+--------------------------------------------------------------------------------
+
+5.1 核心思想：不同 slice 的 LOAD/COMPUTE/STORE 重叠
+
+Software Pipeline 的核心洞察是：三个步骤可以来自三个不同的迭代（slice），
+在同一个时间窗口内并行执行：
+
+  Timestep N:   COMPUTE(slice K)  +  STORE(slice K-2)  +  LOAD(slice K+2)
+                   ↑                      ↑                    ↑
+                Stage 1                Stage 2              Stage 0
+                (算当前)               (存前面的)            (预加载后面的)
+
+5.2 三个时期的对比
+
+  时期        英文名      图中位置    含义
+  ────────   ──────────  ──────────  ──────────────────────────────
+  Filling    填充期      左上角       只有 LOAD，系统刚启动，还未产生
+  (Stage 0)                          可 STORE 的结果
+  ────────   ──────────  ──────────  ──────────────────────────────
+  Kernel     稳态期      右上+右下    LOAD / COMPUTE / STORE 三者同
+  (Stage 1)                          时发生，分别属于不同的 slice
+  ────────   ──────────  ──────────  ──────────────────────────────
+  Draining   排空期      左下角       只有 STORE，新的 LOAD 已结束，
+  (Stage 2)                          系统逐渐清空
+  ────────   ──────────  ──────────  ──────────────────────────────
+
+5.3 右侧图的关键优化：Store 前移
+
+右侧图相对于左侧图的核心变化：
+
+  变化 1 — 消除 TS 0（纯 LOAD）：
+      把第一个 TS 的 LOAD 融合进后续的计算 TS 中
+
+  变化 2 — Store 前移（最关键）：
+      把原本在 TS 5 的 STORE 提前到 TS 2，与 BDC 计算并行
+      效果：slice 0 在 TS 1 算完后，不再等到最后才存，而是在 TS 2 就赶紧存出
+
+  变化 3 — 消除 TS 5（纯 STORE）：
+      最后一个 TS 的 STORE 被消化到了中间的 TS 里
+
+  结果：BDC 从 TS 1 到 TS 4 一直在连续 compute，没有空转的 timestep。
+       总耗时从 6 个 TS 缩减到 4 个 TS。
+
+5.4 为什么要提前 STORE？
+
+每个 slice 算完后尽快 STORE 出去，有两个好处：
+
+  好处 1：释放 LMEM 空间
+    算完的 slice 不再占用 LMEM，腾出空间给后续 slice 使用
+
+  好处 2：BDC 不空转
+    STORE 与后续 slice 的 COMPUTE 并行，不占用额外的 timestep
+
+  slice 视角对比：
+
+    slice    计算时刻     存储时刻（左侧）  存储时刻（右侧）
+    ───────  ──────────  ────────────────  ────────────────
+    slice 0  TS 1         TS 5（拖到最后）  TS 2（提前了）
+    slice 1  TS 2         ...               TS 3
+    slice 2  TS 3         ...               TS 4
+
+  左侧：slice 0 算完后长时间占着 LMEM 不放
+  右侧：slice 0 算完即走，LMEM 占用时间很短
+
+5.5 源码中的实现
+
+在 SwPipeline.cpp 中，默认使用 3-stage pipeline：
+
+  int64_t stage_num = 3;
+  for (遍历 timestep_table 中的每个 tensor) {
+    if (i == 0)         tensor_stage = 0;  // Stage 0: 首 timestep 的 tensor
+    else if (i == last) tensor_stage = 2;  // Stage 2: 末 timestep 的 tensor
+    else                tensor_stage = 1;  // Stage 1: 中间 timestep 的 tensor
+  }
+
+BasicTimeStep::software_pipeline() 作为入口：
+
+  void software_pipeline() {
+    swpipl_stage_num_ = swpipl_->software_pipeline_schedule(timestep_table_);
+    // 更新每个 tensor 的 stage 标记
+    for (auto &row : timestep_table_) {
+      for (auto &iter : row.gdma0_ts_field) {
+        iter.second.stage = get_tensor_swpipl_stage(iter.first);
+      }
+    }
+  }
+
+如果返回 swpipl_stage_num_ == 1，说明该 Group 是单层，不需要流水。
+
+
+六、Memory Aware 优化（负载均衡）
+--------------------------------------------------------------------------------
+
+6.1 为什么还需要 Memory Aware？
+
+Software Pipeline 解决了"空转"问题，但没有解决"负载不均衡"问题。
+
+在每个 timestep 内部，BDC 和 GDMA 的耗时可能相差很大：
+
+  TS    BDC           GDMA          slack       含义
+  ────  ────────────  ────────────  ───────────  ────────────────────
+  TS 0  Conv0         Store out1    +121868      BDC 慢，GDMA 早就闲了
+  TS 1  Add0          Load w1, b1   -5041        GDMA 比 BDC 还慢
+  TS 2  Conv1         （空）          +147456      只有 BDC 干活
+  TS 3  Add1          Load in0,w0   -80623       GDMA 加载太多，拖后腿
+
+  slack > 0：BDC 是瓶颈（GDMA 在"摸鱼"）
+  slack < 0：GDMA 是瓶颈（BDC 在等 GDMA）
+
+整个 Group 的总时间由最慢的那个 TS 决定。如果 TS 3 的 GDMA 拖后腿，
+整个 Group 就被它拖长了。
+
+6.2 Memory Aware 的策略
+
+核心思路：把 GDMA 操作从"忙不过来"的 timestep 挪到"闲着也是闲着"的 timestep。
+
+  优化前（Layer Nearest）：              优化后（Memory Aware）：
+  TS 0: Conv0 + Store out1              TS 0: Conv0 + Store out1 + Load w1  ← 趁 Conv0 慢，多搬点
+  TS 1: Add0  + Load w1, b1             TS 1: Add0  + Load b1               ← 负载变轻了
+  TS 2: Conv1 + （空）                    TS 2: Conv1 + Load in0, w0          ← 把后面的活提前干
+  TS 3: Add1  + Load in0, w0, b0       TS 3: Add1  + Load b0                ← 负载也变轻了
+
+原理：既然 TS 0、TS 2 的 BDC（Conv）算得慢，不如让 GDMA 在这时候多干点活，
+反正 BDC 还没算完。这样每个 TS 的 BDC 和 GDMA 耗时更接近，总时间缩短。
+
+6.3 两个核心函数
+
+  函数                    作用
+  ──────────────────────  ──────────────────────────────────────
+  get_best_ts()           为需要搬走的 GDMA 操作，计算搬到哪个 TS 最划算
+                          选择标准：cycle_profit 最大（减少的周期最多）
+                                  收益相同时选 area 最小（数据量小、距离近优先）
+                          area = size × |best_ts - cur_ts|，代表移动代价
+
+  bubble_tensor_to_       不是"瞬移"过去，而是一步一步像冒泡排序那样挪
+  best_ts()               每步检查边界和收益，防止破坏中间 TS 的依赖关系
+                          重复直到到达 best_ts
+
+6.4 Memory Aware 的五个步骤
+
+  步骤 1：先用 Layer Nearest 分好时间步（得到初始方案）
+  步骤 2：计算每个 TS 的 slack（BDC 耗时 - GDMA 耗时）
+  步骤 3：挑出 GDMA 时间 > BDC 时间的 TS（被 GDMA"拖后腿"的）
+  步骤 4：找这些 TS 里可以移动的 GDMA 操作，确定最优目标 best_ts
+  步骤 5：用冒泡方式把 GDMA 操作往 best_ts 逐步移动，直到无法更优
+
+
+七、时序与空间的对应关系
+--------------------------------------------------------------------------------
+
+时间步分配完成后，timestep_table_ 和 lmem_buffer_ 建立了"时序-空间"的双视角：
+
+  ┌──────────────────────┐        ┌──────────────────────────┐
+  │  timestep_table_      │        │  lmem_buffer_             │
+  │  （时序视角）           │        │  （空间视角）               │
+  │                       │        │                           │
+  │  TS 0: LOAD(slice0)   │        │  slice0: start_ts=0       │
+  │  TS 1: COMPUTE(slc0)  │        │           end_ts=2        │
+  │         LOAD(slice1)  │        │           size=xxx         │
+  │  TS 2: COMPUTE(slc1)  │        │  slice1: start_ts=1       │
+  │         STORE(slice0) │   ←──→ │           end_ts=3        │
+  │  ...                  │  关联   │           size=xxx         │
+  └──────────────────────┘        └──────────────────────────┘
+
+关联规则：
+  - tensor 的 start_ts = 它被 Load 进来的时间步
+  - tensor 的 end_ts   = 它最后一次被使用或 Store 出去的时间步
+  - hold_coeff_ 中的 tensor（如不可切分的权重）生命周期延长到整个 Group 结束
+
+时序信息用于 LmemAllocator 分配 LMEM 地址，确保同时存活的 tensor 不重叠。
+
+
+八、完整数据流图
+--------------------------------------------------------------------------------
+
+  shape_secs (切分方案) + lg_info (Group 信息)
+      │
+      ▼
+  ┌─────────────────────────────┐
+  │  stripe_mine_idx_slice()    │  从 Group 输出反推每个 tensor 的切分
+  │  + update_tensor_infos()    │  设置 mode(TIMESTEP_LOAD/STORE) 等标记
+  │                             │  （详见"反向推断Tensor大小流程说明"文档）
+  └────────────┬────────────────┘
+               │
+               ▼
+  ┌────────────────────────────────────────────┐
+  │  memory_aware_timestep_assignment()        │  ★ 核心编排（一个函数包了三件事）
+  │                                            │
+  │  ┌──────────────────────────────────────┐  │
+  │  │ ① layer_nearest_timestep_assignment  │  │  逐 OP 分配时间步
+  │  │    "每层一个 TS，Load 迟、Store 早"    │  │
+  │  │    └── software_pipeline()           │  │  ← 分配完立即做 3-Stage 流水
+  │  │       Filling / Kernel / Draining     │  │    消除首尾 BDC 空转
+  │  └──────────────────────────────────────┘  │
+  │  ┌──────────────────────────────────────┐  │
+  │  │② Memory Aware 负载均衡                │  │  计算每个 TS 的 slack
+  │  │  get_timestep_cycle_slack()          │  │  挑出负 slack 的 TS
+  │  │  get_best_ts()                       │  │  选最优目标（profit 最大 + area 最小）
+  │  │  bubble_tensor_to_best_ts()          │  │  逐步冒泡移动到 best_ts
+  │  └──────────────────────────────────────┘  │
+  └────────────┬───────────────────────────────┘
+               │
+               ▼
+  ┌─────────────────────────────┐
+  │  gen_hold_coeff()           │  标记常驻 LMEM 的 tensor
+  │                             │  （不可切分权重 / hold_in_lmem）
+  └────────────┬────────────────┘
+               │
+               ▼
+  ┌─────────────────────────────┐
+  │  gen_all_mem_buffer_ts()    │  生成每个 buffer 的 start_ts/end_ts
+  │  + update_all_mem_buffer_   │  计算每个 buffer 的实际 LMEM 大小
+  │    size()                   │  （activation / weight / operation buffer）
+  └────────────┬────────────────┘
+               │
+               ▼
+  ┌─────────────────────────────┐
+  │  LmemAllocator              │  根据 buffer 生命期分配 LMEM 地址
+  │                             │  确保同时存活的 buffer 地址不重叠
+  └────────────┬────────────────┘
+               │
+               ▼
+  ┌─────────────────────────────┐
+  │  CycleCalculator            │  模拟流水线执行，计算总周期
+  │  Filling 期: 只计 Stage0    │  每轮迭代: total = max(BDC, GDMA)
+  │  Kernel 期: Stage0/1/2 重叠 │  逐 slice 推进直到排空
+  │  Draining 期: 只计 Stage2   │
+  └─────────────────────────────┘
+
+
+九、关键约束与边界情况
+--------------------------------------------------------------------------------
+
+1. swpipl_stage_num_ == 1：单层 Group，不需要流水线，所有三步串行执行
+2. 相邻 TS 合并：在 TimeStepCombine 优化 Pass 中，如果 layer_can_merge_backward()
+   返回 false 则保持独立（此合并不在 TimeStepMethod::process() 主流程中，属于后续优化）
+3. hold_coeff_ 中的 tensor：常驻 LMEM，不参与 STORE/LOAD 流水
+4. GDMA 操作移动边界：受限于数据依赖（权重必须在计算前加载完）
+5. area 优先级：同等收益下，优先移动体积小、距离近的 GDMA 操作
+
+
+十、一句话总结
+--------------------------------------------------------------------------------
+
+时间步分配 + Software Pipeline 的本质是：
+
+  Layer Nearest 负责"粗排"——每个 OP 一个 TS，Load 迟 Store 早；
+  Memory Aware 负责"调优"——把 GDMA 操作从忙的 TS 挪到闲的 TS；
+  Software Pipeline 负责"重叠"——让不同 slice 的 LOAD/COMPUTE/STORE
+  在同一个时间窗口内并行执行，最终使得 Group 执行时间趋近于
+  max(BDC 总周期, GDMA 总周期) 而非两者之和。
+
+================================================================================

@@ -1,0 +1,242 @@
+╔══════════════════════════════════════════════════════════════╗
+║          第四周 — LLM 逐 Block 编译 + 权重量化               ║
+╚══════════════════════════════════════════════════════════════╝
+
+【学习目标】
+  1. 理解 LLM 为什么必须逐 block 编译（不是整个模型一把梭）
+  2. 理解为什么 7B 必须权重量化（W8A16 / W4A16）才能放下、跑得动
+  3. 理解 LLM 推理的 Prefill 与 Decode 两个阶段
+  4. 动手：llama2-7b 导出 → 编译成 bmodel（W4/W8）→ 在 BM1684X 上跑文本生成
+
+【参考资料（按优先级）】
+  ⭐⭐⭐  llm_convert 官方文档       docs/quick_start/source_zh/10_llm_convert.rst
+  ⭐⭐⭐  test_llm1.sh 回归测试       regression/script_test/test_llm1.sh
+  ⭐⭐    LlmConverter 源码           python/llm/LlmConverter.py
+  ⭐⭐    LlmInfo 模型配置             python/llm/LlmInfo.py
+  ⭐      LLM-TPU 芯片推理 demo       https://github.com/sophgo/LLM-TPU
+  ⭐      LLMC 精度提升指南           docs/developer_manual/source_zh/21_llmc.rst
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第一部分：核心概念
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────────┐
+│ 1. 为什么必须逐 block 编译？                                 │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ResNet18:  整个模型 45MB → model_transform + deploy 一把梭  │
+│  Llama2-7B: 整个模型 14GB  → 内存放不下，必须拆！            │
+│                                                             │
+│  做法：把 32 个 transformer block 分别导出、分别编译、        │
+│        最后合并成一个 bmodel                                 │
+│                                                             │
+│  llm_convert.py 做的事：                                     │
+│    block_0  → block_0.mlir  → block_0.bmodel  ┐             │
+│    block_1  → block_1.mlir  → block_1.bmodel  ├─→ merge     │
+│    ...                                         │             │
+│    block_31 → block_31.mlir → block_31.bmodel ┘             │
+│    embedding  → embedding.bmodel                             │
+│    lm_head    → lm_head.bmodel                              │
+│                                                             │
+│  而且每个 block 有两个版本：                                  │
+│    block_N.mlir        → Prefill 阶段用（全尺寸 Attention）   │
+│    block_cache_N.mlir  → Decode 阶段用（带 KV Cache 输入）   │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ 2. 为什么 7B 必须权重量化？                                   │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Llama2-7B:                                                 │
+│    FP16 权重: 7B × 2 bytes = 14 GB                          │
+│    BM1684X 总内存: 16 GB                                    │
+│                                                             │
+│  除了权重还要放：                                             │
+│   KV cache:   ~2-4 GB（序列越长越大）                        │
+│    中间激活:   ~1-2 GB（推理时的临时数据）                    │
+│    运行开销:   ~1 GB                                         │
+│                                                             │
+│  FP16 → 14 + 4 + 2 + 1 = 21 GB > 16 GB  ❌ 放不下!          │
+│  W8   →  7 + 4 + 2 + 1 = 14 GB ≤ 16 GB  ✅                 │
+│  W4   → 3.5 + 4 + 2 + 1 = 10.5 GB     ✅ 最宽裕            │
+│                                                             │
+│  W4/W8 是"仅权重量化"（Weight-Only）：                        │
+│    W8A16 = 8-bit 权重 + FP16 激活（精度最高）                 │
+│    W4A16 = 4-bit 权重 + FP16 激活（最省内存）                 │
+│    激活值不量化，保持 FP16                                    │
+│                                                             │
+│  权重量化算法: RTN (Round To Nearest)                         │
+│    per-channel（W8）或 per-group（W4, group_size=64）         │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Prefill 与 Decode 两个阶段                                │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  例子：输入 "今天天气很不错"（8 个 token）                     │
+│                                                             │
+│  ┌─────────── Prefill ──────────┬────── Decode ──────┐      │
+│  │                              │                    │      │
+│  │  一次处理 8 个 token          │  一次出 1 个 token  │      │
+│  │  计算矩阵乘法，算力密集型      │  查 KV Cache，带宽密集│     │
+│  │  输出第一个 token: "，"       │  输出: "适合"      │      │
+│  │  把 KV 存入 Cache             │       "户外"      │      │
+│  │                              │       "运动"      │      │
+│  │                              │       "。"        │      │
+│  └──────────────────────────────┴────────────────────┘      │
+│                                                             │
+│  编译时要同时生成两个版本：                                    │
+│    block.mlir        → Prefill（输入全部 prompt token）       │
+│    block_cache.mlir  → Decode（额外输入: 历史的 KV Cache）    │
+│                                                             │
+│  关键词：KV Cache = 注意力机制中已计算的 Key/Value 矩阵         │
+│          避免了每次 decode 重新计算整个序列                    │
+└─────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第二部分：动手操作
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【环境准备】
+
+  1. 下载模型
+     git lfs install
+     git clone https://huggingface.co/meta-llama/Llama-2-7b-hf
+
+  2. 进入 Docker
+     docker start tpu-mlir
+     docker exec -it tpu-mlir bash
+     source /workspace/tpu-mlir/envsetup.sh
+
+  3. 预览配置（建议先跑，确认参数正确）
+     cd /workspace
+     llm_convert.py \
+       -m Llama-2-7b-hf \
+       -s 2048 \
+       -q w4bf16 \
+       -g 64 \
+       -c bm1684x \
+       -o llama2_7b_W4BF16 \
+       --dry_run
+
+
+【步骤一】编译 bmodel（一键完成逐 block 编译 + 合并）
+
+  # W4BF16 版本（4-bit 权重，推荐）
+  llm_convert.py \
+    -m Llama-2-7b-hf \
+    -s 2048 \
+    -q w4bf16 \
+    -g 64 \
+    -c bm1684x \
+    -o llama2_7b_W4BF16
+
+  # W8BF16 版本（8-bit 权重，精度更高）
+  llm_convert.py \
+    -m Llama-2-7b-hf \
+    -s 2048 \
+    -q w8bf16 \
+    -c bm1684x \
+    -o llama2_7b_W8BF16
+
+  参数说明：
+    -m   模型目录（HuggingFace 格式）
+    -s   最大序列长度（越长越费 KV Cache）
+    -q   bf16 | f16 | w8bf16 | w4bf16 | w8f16 | w4f16
+    -g   量化组大小（W4 默认 64）
+    -c   目标芯片
+    -o   输出目录
+
+  编译时间：约 1-2 小时（取决于机器性能）
+
+
+【步骤二】在 BM1684X 芯片上运行文本生成
+
+  1. 把 bmodel 拷到芯片服务器
+     scp llama2_7b_W4BF16/*.bmodel user@芯片IP:~/llm/
+
+  2. 在芯片服务器上克隆 LLM-TPU 运行时
+     git clone https://github.com/sophgo/LLM-TPU.git
+     cd LLM-TPU/models/Llama2/python_demo
+     pip3 install -r requirements.txt
+
+  3. 运行
+     python3 run.py \
+       --model ~/llm/llama2_7b_W4BF16_xxx.bmodel \
+       --tokenizer /path/to/Llama-2-7b-hf \
+       --prompt "Hello, how are you?"
+
+
+【步骤三】记录产出
+
+  ┌────────────────────────┬──────────────┬──────────────┐
+  │         指标            │   W8BF16     │   W4BF16     │
+  ├────────────────────────┼──────────────┼──────────────┤
+  │ bmodel 文件大小         │    ~7 GB     │   ~3.5 GB    │
+  │ 首 token 延迟 (Prefill) │      ?  ms   │      ?  ms   │
+  │ 每 token 延迟 (Decode)  │      ?  ms   │      ?  ms   │
+  │ 吞吐 (token/s)          │      ?       │      ?       │
+  │ 输出文本质量（ 主观）     │      ?       │      ?       │
+  └────────────────────────┴──────────────┴──────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第三部分：深入理解（可以跑单 block 测试）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【对比 resnet18 和 llama2 的编译命令】
+
+  ┌──────────────┬──────────────────────────────────────────┐
+  │              │              编译命令差异                  │
+  ├──────────────┼──────────────────────────────────────────┤
+  │ ResNet       │ model_transform → model_deploy            │
+  │ (整个模型)   │ --quantize F16 / INT8                     │
+  │              │ 一条 deploy 搞定                          │
+  ├──────────────┼──────────────────────────────────────────┤
+  │ Llama2       │ model_transform → model_deploy
+
+  新增关键参数：
+    --q_group_size 64    量化组大小（W4 的 per-group 粒度）
+    --addr_mode io_alone 地址模式（LLM 专用，输入输出独立地址空间）
+    --quant_input        输入的量化（让数据流前后对齐）
+    --quant_output       输出的量化
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第四部分：学习检查清单
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  □ 能解释：为什么 14GB 的 FP16 模型不能在 16GB 芯片上直接跑
+  □ 能解释：KV Cache 是什么作用
+  □ 能解释：Prefill 和 Decode 的计算特点区别
+  □ 能解释：W4A16 和 W8A16 各代表什么含义
+  □ 能解释：逐 block 编译 vs 整个模型编译的区别
+  □ 能运行：llm_convert.py 一键编译 llama2-7b bmodel
+  □ 能运行：在 BM1684X 上用 python_demo 跑文本生成
+  □ 能对比：W4 vs W8 的大小、速度、输出质量
+  □ 能复现：单个 block 的 model_transform + model_deploy 流程
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                            速查表
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  做什么                    │ 命令 / 文件
+  ──────────────────────────┼─────────────────────────────────
+  一键编译 LLM bmodel       │ llm_convert.py -m <模型> -s <长度> -q <量化> -c <芯片>
+  单 block 编译参考          │ regression/script_test/test_llm1.sh
+  模型配置定义               │ python/llm/LlmInfo.py
+  芯片端文本生成             │ LLM-TPU/models/Llama2/python_demo/run.py
+  权重量化精度提升           │ llmc-tpu (外部工具)
+  查看 bmodel 信息         │ model_tool --info xxx.bmodel
+
+
+
+  # 记得先修一下芯片上的 config（如果还没修过）
+sed -i 's/"eos_token_id": 2/"eos_token_id": [2]/' ~/huang_ming_yong/llama2_7b_W4BF16_s512/config/generation_config.json
+
+# 跑 Qwen3 cpp_demo
+cd ~/huang_ming_yong/LLM-TPU/models/Qwen3/cpp_demo/build
+./pipeline -m ../../../../llama2_7b_W4BF16_s512/llama2_7b_W4BF16_s512.bmodel -c ../../../../llama2_7b_W4BF16_s512/config -s -p "hello world"

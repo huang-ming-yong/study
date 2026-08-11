@@ -1,0 +1,184 @@
+================================================================================
+  源码走读笔记：Conv 算子从 ONNX → Tpu IR 的完整路径（第七周产出）
+  对象：ResNet18 第一个 7×7 卷积
+================================================================================
+
+总览
+
+  ONNX → ①前端转换 → ②Top定义+接口 → ③图融合 → ④Lowering(F16/INT8)
+         origin.mlir      resnet18.mlir   tpu.mlir
+
+
+================================================================================
+  一、前端入口：ONNX 怎么变成 Top IR
+================================================================================
+
+[1] python/tools/model_transform.py
+    作用：命令行入口，流程编排
+    做了什么：解析命令行参数 → 创建 OnnxTransformer → 先调 converter.generate_mlir()
+             生成 origin.mlir → 再调 mlir_opt_for_top() 跑 Canonicalize 生成最终 top mlir
+
+[2] python/transform/BaseConverter.py
+    作用：全局符号表
+    做了什么：维护 operands(名字→MLIR Value)、tensors(名字→numpy 权重)、
+             shapes(名字→shape) 三张映射表，ONNX 靠字符串名字连接算子
+    关键方法：addOperand(name, op) 注册算子输出 / getOperand(name) 拿上游 Value /
+             getWeightOp(name) 创建 Weight Op / WeightToNpz() 保存权重文件
+
+[3] python/transform/MLIRImporter.py
+    作用：用 MLIR Python 绑定在内存里创建 IR
+    做了什么：create_input_op() → top.Input / create_weight_op() → top.Weight /
+             create_return_op() → func.return / print_module() → 序列化 .mlir 文本
+
+[4] python/transform/OnnxConverter.py（核心翻译官）
+    作用：遍历 ONNX 图，按 onnxop_factory 字典逐个翻译节点
+    Conv 翻译（第 981 行 convert_conv_op）：
+      def convert_conv_op(self, onnx_node):
+          # ① 从 ONNX 节点读属性
+          kernel_shape = onnx_node.attrs['kernel_shape']   # [7, 7]
+          strides = onnx_node.attrs.get('strides', ...)     # [2, 2]
+          pads = onnx_node.attrs.get('pads', ...)           # [3,3,3,3]
+
+          # ② 拿输入和 filter 的 Value（可能是上游算子输出，也可能是 weight）
+          op = self.getOp(onnx_node.inputs[0])
+          filter_op = self.getOp(onnx_node.inputs[1])
+          bias_op = self.getWeightOp(onnx_node.inputs[2])  # bias 按 weight 处理
+
+          # ③ 创建 Top IR 的 Conv Op
+          new_op = top.ConvOp(self.unranked_type, *operands,
+                              kernel_shape=kernel_shape, strides=strides,
+                              pads=pads, dilations=dilations, group=group,
+                              do_relu=False, ...).output
+
+          # ④ 注册：下游算子通过这个名字找到这个 Value
+          self.addOperand(onnx_node.name, new_op)
+
+
+================================================================================
+  二、Top Dialect：算子的定义与接口
+================================================================================
+
+[5] include/tpu_mlir/Dialect/Top/IR/TopOps.td（第 1411 行）
+    作用：用 TableGen 声明式定义 Top_ConvOp
+    内容：
+      - 输入：input(tensor), filter(tensor), bias(tensor)
+      - 输出：output(tensor)
+      - 属性：kernel_shape, strides, pads, group, dilations, inserts,
+              do_relu, relu_limit, auto_pad, dynweight_reorderd, weight_is_coeff,
+              do_winograd, in_int4_scale, in_int4_zp
+      - 接口：SupportFuseRelu（支持 ReLU 融合标记）,
+              InferenceInterface（shape 推断接口）
+    一句话：声明 Conv 的输入输出和属性，编译时自动生成 C++ 类（TopConvOp），
+            提供 getKernelShape()/setDoRelu() 等 getter/setter。
+
+[6] lib/Dialect/Top/Interfaces/Conv.cpp
+    作用：Conv 算子的通用逻辑实现
+    关键函数 parseParam()：
+      - 从 MLIR Type 里读 input/output 的 shape → 提取 N, IC, OC, H, W
+      - 读 kernel_shape, pads, strides, dilations → 组装成 conv_attr_t 结构体
+      - 读 do_relu, relu_limit, has_bias
+    一句话：把 mlir 属性解析成方便后续 Pass 使用的 C++ 结构体。
+
+
+================================================================================
+  三、图融合（Canonicalize）：让计算图更高效
+================================================================================
+
+[7] lib/Dialect/Top/Canonicalize/Conv.cpp
+    作用：Conv 相关的 Pattern Rewrite（匹配 IR 模式→替换为新模式）
+
+    (a) Conv1dTo2d：1D 卷积适配为 2D
+        匹配条件：kernel_shape.size() == 1（如 kernel=[3]）
+        做了什么：kernel_shape/strides/pads/dilations 各补一个维度=1
+        效果：[3]→[3,1], [2]→[2,1], pads 左右各插 0
+
+    (b) Conv+ReLU 融合：
+        匹配条件：Conv 后面紧跟着 ReLU
+        做了什么：Conv.do_relu = false → true，删除下游的 ReLU Op
+        效果：origin.mlir 里 %4=top.Conv + %5=top.Relu
+              → resnet18.mlir 里 %3=top.Conv(do_relu=true)，ReLU 消失
+
+    (c) Conv+BN 融合：
+        匹配条件：Conv 后面紧跟着 BatchNorm
+        做了什么：BN 的乘(γ/σ)加(β-μγ/σ)合并到 Conv 的 weight 和 bias 里
+        效果：推理时省掉 BN 的计算
+
+[8] lib/Dialect/Top/Transforms/ProcessorOptimize/OptimizeBM1684X.cpp
+    作用：针对 BM1684X 芯片的特殊图优化
+    举例：Unsqueeze→Expand→Reshape→Transpose→MatMul 组合替换为更高效的形式
+    一句话：在 Top 层就把 BM1684X 不擅长的算子组合替换掉。
+
+
+================================================================================
+  四、Top→Tpu Lowering：top.Conv → tpu.Conv2D（本周重点）
+================================================================================
+
+[9] lib/Conversion/TopToTpu/BM1684X/Conv.cpp
+
+    包含三条路径：
+
+    (a) F16 路径（第 641 行 LoweringF16，~35 行）
+        核心逻辑：
+          for (int i = 0; i < 2; i++) {           // 遍历 input(0) 和 filter(1)
+              auto opd = op.getOperand(i);
+              if (auto weightOp = dyn_cast<top::WeightOp>(opd.getDefiningOp())) {
+                  operands.push_back(weightOp.clone_f16(op));  // Weight: f32→f16
+              } else {
+                  operands.push_back(opd); // 非Weight: 原样保留(输入前面有Cast)
+              }
+          }
+          operands.push_back(bias_value);  // bias 保持 f32
+          auto newType = getQuantF16Type(op.getOutput());  // 输出类型切 f16
+          auto newValue = CreateConvOp(rewriter, p.dims, op->getLoc(),
+                                       newType, operands, attrs);  // 建 tpu.Conv2D
+          rewriter.replaceOp(op, {newValue});  // 替换旧 top.Conv
+
+        做了什么：weight clone_f16() 转半精度，输出类型换 f16，
+                  创建 tpu.Conv2D，替换 top.Conv。
+                  新增属性：quant_mode=MultiplierShift, kernel_zp=0,
+                           round_mode=HalfUp, with_bias=true。
+
+    (b) INT8 路径（第 56 行 LoweringINT8，~200 行）
+        关键差异（与 F16 对比）：
+          ① 读 calibration table → getScaleAndZeroPoint()
+             拿 input/output 的 scale 和 zero_point
+          ② findMinMax() 统计 filter 的 f32 数据的 min/max
+          ③ 决定量化方案：fsign<0 → 对称量化到[-127,127]
+                           fsign>=0 → 非对称量化到[0,255]
+          ④ filter f32 → int8/uint8
+          ⑤ bias f32 → int32（bias_scale = input_scale × weight_scale）
+
+        一句话：F16 只需 clone_f16() 转类型，INT8 需要校准表 +
+                统计 min/max + 量化 weight+bias。
+
+    (c) BF16 路径（第 608 行）：与 F16 相同结构，clone_bf16() 替换。
+
+
+================================================================================
+  五、IR 变化对照（ResNet18 第一个 7×7 Conv）
+================================================================================
+
+          origin.mlir        resnet18.mlir        tpu.mlir
+          ───────────        ─────────────        ────────
+算子名     top.Conv            top.Conv            tpu.Conv2D
+do_relu    false               true                true
+独立ReLU   有                  ✗                   ✗
+精度       f32                 f32                 f16
+输出shape  *xf32               1x64x112x112xf32    1x64x112x112xf16
+quant_mode ✗                   ✗                   MultiplierShift
+kernel_zp  ✗                   ✗                   0
+round_mode ✗                   ✗                   HalfUp
+weight形状 [64,3,7,7]         [64,3,7,7]          [64,3,7,7]
+state      TOP_F32             TOP_F32             TPU_LOWERED
+
+
+================================================================================
+  产出要求（gate）
+================================================================================
+
+  产出1 ✓ 本篇走读笔记（Conv: ONNX → Top IR → Tpu IR 的完整路径 + 每步源码位置）
+  产出2 □ 指出一个可优化的瓶颈点（具体、可论证）
+        候选方向：
+        - INT8 路径 Lowering 时 bias 量化是否有精度损失？
+        - Conv+BN 融合是否漏了某种常见 pattern？
+        - BM1684X Lowering 是否存在不必要的内存拷贝？

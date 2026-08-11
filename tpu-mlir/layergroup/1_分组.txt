@@ -1,0 +1,686 @@
+================================================================================
+            LayerGroup Pass —— 分组流程完整说明
+================================================================================
+
+本文档描述 LayerGroup 中"如何把子网内的连续算子划分为若干 Group"的完整流程，
+涵盖从宏观分组搜索（DP + 贪心）到微观层内分配（切分 → 时间步 → 地址）的全链路。
+
+本文档与以下文档衔接：
+  - 《反向推断Tensor大小流程说明.txt》：本文档第二步"时间步分配"内部的 BFS 反向推断细节
+  - 《分配时间步.txt》：本文档第二步"时间步分配"中 Layer Nearest + Software Pipeline 细节
+  - 《分配地址.txt》：本文档第三步"LMEM 地址分配"的完整细节
+
+源码入口：[GroupMethod.cpp:545-738](lib/Dialect/Tpu/Transforms/LayerGroup/GroupMethod.cpp#L545)
+           is_layer_group_valid() —— 验证一个候选 Group 是否合法并计算 cost
+
+参考算能科技官网资料：TPU-MLIR LayerGroup 编译器优化白皮书
+
+
+一、背景：Layergroup 要解决什么问题？
+--------------------------------------------------------------------------------
+
+BM1684X 的片上 Local Memory（LMEM）很小（每个 NPU 仅 256KB），而神经网络
+的一个 tensor 可能有几 MB。因此必须把大 tensor 切成小块（tile），分批搬进
+LMEM 计算，算完再搬出去。
+
+LayerGroup 的核心权衡：
+  - 组越大：算子间中间结果不需要写出到 DDR，节省 GDMA 带宽
+  - 组越大：单次要放入 LMEM 的数据越多，可能放不下，需要切得更细
+  - 切得越细：每次算的数据量变小，计算效率降低
+
+→ 在"减少 DDR 访问"和"保持计算效率"之间找最优平衡点。
+
+LayerGroup 的输入：
+  - subnet_ops：一个子网内所有 OP 的有序列表（经过图划分后的连续子图）
+  - 硬件参数：LMEM 大小、NPU 数量、EU 数量等
+
+LayerGroup 的输出：
+  - lg_infos：若干 LgInfo 对象，每个描述一个 Group
+    · 包含哪些 OP
+    · 切分方案（shape_secs）
+    · 时间步表（timestep_table_）
+    · LMEM 地址分配（lmem_buffer_）
+    · 执行周期（group_cost）
+
+
+二、整体流程概览（两阶段 + 三步骤）
+--------------------------------------------------------------------------------
+
+LayerGroup 的分组流程可以分为两个大阶段：
+
+  第一阶段（宏观）：搜索最优切割点 —— 把 N 层划分为若干 Group
+    1.1  获取基本分组（Base Groups）
+    1.2  聚合为 Cluster（贪心降规模）
+    1.3  动态规划搜索最优切割
+    1.4  局部搜索微调（移板子 / 删板子）
+
+  第二阶段（微观）：单 Group 内分配 —— 对每个候选 Group 验证合法性
+    2.1  初始化切分方案（init_group_data_secs）
+    2.2  反向推断 + 时间步分配（assignTimeStep）
+    2.3  LMEM 地址分配 + 周期计算（assignLmemAddrWithSecs）
+
+宏观搜索会产生大量候选 Group，每个候选 Group 都要跑一遍微观验证
+（is_layer_group_valid），取 cost 最小的组合作为最终方案。
+
+源码入口函数调用链：
+
+  GroupMethod::dynamic_programming_layer_group_with_cluster()  ← 第一阶段
+    ├── get_base_groups()                   ← 1.1 基本分组
+    ├── get_group_clusters_with_dynamic_programming()  ← 1.2 聚合
+    ├── dynamic_programming_kernel()        ← 1.3 DP 搜索
+    └── consider_redundant_computation_and_gdma_cost() ← 1.4 局部微调
+
+  GroupMethod::is_layer_group_valid()       ← 第二阶段（被 DP 反复调用）
+    ├── init_group_data_secs()              ← 2.1 初始化切分
+    ├── time_step->assignTimeStep()         ← 2.2 时间步 + 反向推断
+    └── lmem_allocator->assignLmemAddrWithSecs() ← 2.3 地址分配
+
+
+三、第一阶段：宏观分组搜索（寻找最优切割点）
+--------------------------------------------------------------------------------
+
+3.1 获取基本分组（Base Groups）
+
+对应 [GroupMethod.cpp:402-428](lib/Dialect/Tpu/Transforms/LayerGroup/GroupMethod.cpp#L402)
+
+将 subnet_ops 中连续的、支持 LayerGroup 的算子聚合成一个 base_group，
+不支持的算子单独成组。
+
+规则：
+  - isLgSupport(op) = true  → 放入当前 base_group
+  - isLgSupport(op) = false → 当前 base_group 封口，该 OP 单独成组
+  - 3D 卷积/池化与 binary shape 混合时 → tmp_group_into_base() 额外拆分
+
+源码位置：[LayerGroupUtil.cpp:96-100](lib/Dialect/Tpu/Transforms/LayerGroup/LayerGroupUtil.cpp#L96)
+          isLgSupport(op) 判断算子是否支持放入 LayerGroup
+
+3.2 聚合为 Cluster —— "合"的思想
+
+对应 [GroupMethod.cpp:870-1000](lib/Dialect/Tpu/Transforms/LayerGroup/GroupMethod.cpp#L870)
+
+当网络层数 N 很大时（如 N=100），直接动态规划 O(N²) 会导致编译时间过长。
+因此先聚合：将相邻的若干层合并为一个 Cluster。
+
+聚合策略（贪心扩展）：
+  - 从 start_idx 出发，逐层向后扩展
+  - 每次判断"加上这层后能否形成合法 Group"且"合了比单独算更优"
+  - 合法且更优 → 继续扩展（cluster_size++）
+  - 不合法或不更优 → 封口，开新 cluster
+  - 受 MAX_GROUP_CLUSTER = 50 限制
+
+效果：
+  合之前: [L0] [L1] [L2] [L3] ... [L99]     → 100 个单元
+  合之后: [C0: L0..L2] [C1: L3..L7] ...     → ≤50 个 cluster
+
+3.3 动态规划搜索最优切割
+
+对应 [GroupMethod.cpp:1380-1640](lib/Dialect/Tpu/Transforms/LayerGroup/GroupMethod.cpp#L1380)
+          dynamic_programming_kernel()
+
+在聚合后的 clusters 上做 DP，维护两个二维表：
+
+  cost_table[i][j]   = 把 clusters[i..j] 处理完的最小总 cycle 数
+  cut_points[i][j]   = 达到该最小值的切割点位置
+                        (k == j 表示不切，整段一个 Group)
+
+算法（经典矩阵链乘 DP）：
+
+  第一步：对角线初始化
+    for j in 0..K-1:
+        cost_table[j][j] = 单个 cluster[j] 作为一个 Group 的 cost
+        cut_points[j][j] = j
+
+  第二步：预计算 single_group_costs（OpenMP 并行）
+    对所有区间 [start, end] (len ≥ 2)，计算 把 clusters[start..end] 合成
+    一个 Group 的 cost。如果不合法，cost = MAX_COST（无穷大）。
+
+  第三步：DP 递推
+    for len = 2..K:
+        for start = 0..K-len:
+            end = start + len - 1
+
+            cost = single_group_costs[start][end]   ← 方案 A: 不切
+            optimal_cut = end
+
+            for sweep = start..end-1:               ← 方案 B: 切在 sweep
+                temp = cost_table[start][sweep] + cost_table[sweep+1][end]
+                if temp < cost:
+                    cost = temp
+                    optimal_cut = sweep
+
+            cost_table[start][end] = cost
+            cut_points[start][end] = optimal_cut
+
+  第四步：回溯提取切割点
+    从 cut_points[0][K-1] 递归提取：
+      if cut_points[i][j] == j  → [i..j] 是一个完整 Group
+      else                       → 在 cut_points[i][j] 处切开，递归处理两边
+
+3.4 局部搜索微调 —— "分"的思想
+
+DP 的结果是全局最优的——但仅限于"在 cluster 之间切割"这个搜索空间。
+聚合过程可能丢失了更细粒度的切割方案。
+
+3.4a 移板子（consider_redundant_computation_and_gdma_cost）
+  对应 [GroupMethod.cpp:2228-2309](lib/Dialect/Tpu/Transforms/LayerGroup/GroupMethod.cpp#L2228)
+
+  对每个相邻 Group 之间的切割点，尝试左右移动：
+    - 原始 cut = 3  →  尝试 cut=2, cut=1, cut=0
+    - 每次移动后重新计算左侧 Group + 右侧 Group 的 cost
+    - 如果更优 → 更新切割点位置
+
+3.4b 删板子（merge_cut_idx_to_reduce_gdma_cost）
+  对应 [GroupMethod.cpp:2312-2403](lib/Dialect/Tpu/Transforms/LayerGroup/GroupMethod.cpp#L2312)
+
+  尝试删除某个切割点，合并两个相邻 Group：
+    - 如果 cost([A+B]) < cost([A]) + cost([B])
+    - → 删除切割点，两个 Group 合并
+
+  原理：两个小 Group 各自付出 GDMA Load/Store 代价，合成一个大 Group 后
+  中间数据留在 LMEM，反而省了搬运开销。
+
+注意：这两个微调函数在当前主流程中默认未启用，替代方案是
+dynamic_programming_kernel 内部的 shape_secs_search_strategy 机制。
+
+3.5 策略总结：合 → DP → 分
+
+  ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │  合       │ → │  DP      │ → │  分       │
+  │  (聚合)   │    │  (搜索)  │    │  (微调)   │
+  │          │    │          │    │          │
+  │ 贪心扩展  │    │ O(K²)   │    │ 移板子    │
+  │ N→≤50   │    │ 全局最优  │    │ 删板子    │
+  └──────────┘    └──────────┘    └──────────┘
+  降复杂度        找最优解        补精度损失
+
+
+四、第二阶段：微观层内分配（单 Group 验证）
+--------------------------------------------------------------------------------
+
+当宏观搜索产生一个候选 Group 区间后，需要验证它是否合法（能否在 LMEM 限制下
+完成计算），并算出它的执行 cost。这就是 is_layer_group_valid() 的工作。
+
+4.1 第一步：初始化切分方案（init_group_data_secs）
+
+对应 [LayerGroupUtil.cpp:753-829](lib/Dialect/Tpu/Transforms/LayerGroup/LayerGroupUtil.cpp#L753)
+
+计算该 Group 需要的总 LMEM 大小（所有输入 + 输出 + 中间 buffer + 权重），
+与 LMEM 容量比较，决定切几分。
+
+  total_secs = ceil(total_size / LMEM_BYTES)
+
+  分配优先级: N 维优先 → H 维备选 → W 维兜底
+
+    nsecs = min(total_secs, max_nsecs)
+    total_secs = ceil(total_secs / nsecs)
+    hsecs = total_secs
+    如果 hsecs > max_hsecs → 启动 wsecs
+
+  Tensor 在 LMEM 中的两种存储模式：
+
+    对齐存储: n × ceil(c, NPU_NUM) × align_up(h×w, EU_NUM) × dtype_size
+             （给 BDC 计算用，需要对齐到 EU 单元）
+
+    紧凑存储: n × ceil(c, NPU_NUM) × h×w × dtype_size
+             （给 GDMA 搬运用，不需要对齐）
+
+如果连最大切分（max_shape_secs）都放不下 LMEM → 直接返回失败。
+
+4.2 第二步：反向推断 + 时间步分配（assignTimeStep）
+
+对应 BasicTimeStep.cpp → TimeStepMethod.cpp → SwPipeline.cpp
+
+4.2a 反向推断（backward_update_slice）
+  对应 [LayerGroupUtil.cpp:2062-2260](lib/Dialect/Tpu/Transforms/LayerGroup/LayerGroupUtil.cpp#L2062)
+
+  从 Group 的输出 tensor 出发，按 shape_secs 切分，BFS 反向逐 OP 调用
+  BackwardN/C/D/H/W() 反推每个输入 tensor 的 tile 起止范围。
+
+  详细流程参见《反向推断Tensor大小流程说明.txt》。
+
+4.2b 时间步分配（memory_aware_timestep_assignment）
+  对应 [TimeStepMethod.cpp]
+
+  三个子步骤递进：
+    ① Layer Nearest：每层一个 TS，Load 迟 Store 早
+    ② Software Pipeline：3-Stage 流水线，让不同 tile 的 LOAD/COMPUTE/STORE
+       重叠，消除首尾 BDC 空转
+    ③ Memory Aware：计算每个 TS 的 slack（BDC 耗时 - GDMA 耗时），
+       把 GDMA 操作从"忙不过来的 TS"挪到"闲着也是闲着的 TS"
+
+  输出: timestep_table_（每个 TS 谁干活）+ lmem_buffer_（每个 buffer 的生命期）
+
+  详细流程参见《分配时间步.txt》。
+
+4.3 第三步：LMEM 地址分配（assignLmemAddrWithSecs）
+
+对应 [LmemAllocator.cpp]
+
+输入：每个 buffer 的 (start_ts, end_ts, size)
+输出：每个 buffer 的 LMEM addr
+
+  核心算法：
+    ① update_all_mem_buffer_size() — 计算每个 buffer 大小
+    ② membuf_heap_create()         — 建冲突堆（跟踪 buffer 间竞争关系）
+    ③ 主分配循环：
+        - 排序（conflict↓ → area↓ → start_ts↑）
+        - 遍历为每个 buffer 算候选地址（时间重叠的互斥、bank conflict 规避）
+        - 选地址最小的赢家分配
+        - 从冲突堆删除赢家
+    ④ 如果能塞下 → 成功；塞不下 → 当前 shape_secs 无效，尝试其他方案
+
+  详细流程参见《分配地址.txt》。
+
+4.4 周期计算（CycleCalculator）
+
+分配完地址和时间步后，CycleCalculator 模拟流水线执行，计算总周期：
+
+  Filling 期（Stage 0）：只计 LOAD
+  Kernel 期（Stage 0/1/2 重叠）：每轮 total += max(BDC, GDMA)
+  Draining 期（Stage 2）：只计 STORE
+
+这个 cost 就是 DP 中 cost_table 的数值来源。
+
+
+五、完整的调用链路图
+--------------------------------------------------------------------------------
+
+  subnet_ops（N 个连续算子）
+      │
+      ▼
+  ┌──────────────────────────────────┐
+  │ get_base_groups()                │  按 isLgSupport 初步划分子网
+  │ 输出: base_groups[]              │
+  └────────────┬─────────────────────┘
+               │
+               ▼
+  ┌──────────────────────────────────┐
+  │ structure_detect (可选)           │  检测重复结构（如 Transformer block）
+  │ 复用已计算的 DP 结果              │
+  └────────────┬─────────────────────┘
+               │ 未检测到结构
+               ▼
+  ┌──────────────────────────────────┐
+  │ get_group_clusters_with_DP()     │  "合"：贪心聚合，N → K（K≤50）
+  │ 输出: clusters[]                 │
+  └────────────┬─────────────────────┘
+               │
+               ▼
+  ┌──────────────────────────────────┐
+  │ dynamic_programming_kernel()     │  "DP"：自底向上填表
+  │                                 │
+  │  ┌────────────────────────────┐  │
+  │  │ 预计算 single_group_costs   │  │  对每个 [start,end] 区间
+  │  │ (OpenMP 并行)               │  │  调用 is_layer_group_valid()
+  │  │                            │  │  ┌──────────────────────┐
+  │  │ 结果存入                    │  │  │ ① init_group_data_   │
+  │  │ single_group_costs[][]     │  │  │    secs()            │
+  │  └────────────────────────────┘  │  │ ② assignTimeStep()   │
+  │               │                  │  │   ├─ backward_update  │
+  │               ▼                  │  │   │  _slice()        │
+  │  ┌────────────────────────────┐  │  │   ├─ layer_nearest   │
+  │  │ DP 递推填表                 │  │  │   ├─ sw_pipeline    │
+  │  │ cost_table[][]             │  │  │   └─ memory_aware   │
+  │  │ cut_points[][]             │  │  │ ③ assignLmemAddr    │
+  │  └────────────┬───────────────┘  │  │    WithSecs()        │
+  │               │                  │  └──────────────────────┘
+  │               ▼                  │
+  │  ┌────────────────────────────┐  │
+  │  │ 递归回溯 cut_points         │  │
+  │  │ 输出: cut_result           │  │
+  │  └────────────────────────────┘  │
+  └────────────┬─────────────────────┘
+               │
+               ▼
+  ┌──────────────────────────────────┐
+  │ 局部搜索微调（分）                 │
+  │  · 移板子（挪切割点）              │
+  │  · 删板子（合并相邻 Group）         │
+  └────────────┬─────────────────────┘
+               │
+               ▼
+  ┌──────────────────────────────────┐
+  │ get_final_groups()               │  根据 cut_results_ 生成最终
+  │ 输出: lg_infos[]                 │  LgInfo 列表
+  └────────────┬─────────────────────┘
+               │
+               ▼
+  后续 Pass（GroupOps 构建、Codegen 等）
+
+
+六、Group 的类型（set_group_type）
+--------------------------------------------------------------------------------
+
+对应 [GroupMethod.cpp:219-245](lib/Dialect/Tpu/Transforms/LayerGroup/GroupMethod.cpp#L219)
+
+不同类型的 Group 在切分策略上有所不同（例如 GROUP_SMALL_C 允许切 C 维）：
+
+  优先级顺序（从高到低）：
+    GROUP_3D      ：包含 Conv3D/Pool3D 等 5D 算子
+    GROUP_SMALL_C ：C 维较小（< NPU_NUM/2），H 维较大；适合 C 维切分
+    GROUP_MM      ：包含 MatMul/Attention，允许右矩阵 C 维不切
+    GROUP_NORMAL  ：默认类型，N 和 H 维可切
+
+
+七、关键约束条件总结
+--------------------------------------------------------------------------------
+
+1. LMEM 容量限制：所有同时存活的 buffer 总大小不能超过 LMEM_BYTES
+2. 逐层膨胀：每经过一个 Conv/Pool 类 OP，H/W 范围向外膨胀（margin）
+3. 累积效应：多层连续卷积导致 margin 层层叠加，冗余计算越来越大
+4. 多分支一致性：同一 tensor 的多条推断路径结果必须可合并（详见反向推断文档）
+5. 终止边界：到达 Group 输入（来自 DDR）时停止反向
+6. Bank Conflict：同一 TS 内 GDMA 和 BDC 不能访问同一个 bank
+7. 硬件约束：不同芯片对 HW margin 的支持程度不同
+8. MAX_GROUP_CLUSTER = 50：限制 DP 规模，保证编译时间可控
+
+
+================================================================================
+附录 A：完整走读示例
+================================================================================
+
+A.1 场景设定
+
+一个子网有 6 个连续层，每层都支持 LayerGroup（isLgSupport 全部为 true）：
+
+  L0: Conv2D  (H=56, W=56, C=64,  kernel=3, stride=1, pad=1)
+  L1: Add     (逐元素操作)
+  L2: Conv2D  (H=56, W=56, C=128, kernel=3, stride=1, pad=1)
+  L3: Pool2D  (H=56, W=56, kernel=2, stride=2)
+  L4: Conv2D  (H=28, W=28, C=256, kernel=1, stride=1, pad=0)
+  L5: Add     (逐元素操作)
+
+硬件: BM1684X, LMEM=256KB/NPU, NPU_NUM=64
+
+A.2 第一阶段：宏观分组
+
+Step 1: get_base_groups()
+  6 层全部支持 LayerGroup → 1 个 base_group = [L0, L1, L2, L3, L4, L5]
+
+Step 2: get_group_clusters_with_dynamic_programming()
+  N=6 ≤ 50，max_cluster_size = 1
+  → 不聚合，每层自己就是一个 cluster:
+    C0=[L0], C1=[L1], C2=[L2], C3=[L3], C4=[L4], C5=[L5]
+
+Step 3: 预计算 single_group_costs
+
+  对每个区间调用 is_layer_group_valid() 算 cost（数字为示意值，单位: cycle）:
+
+  单层 (len=1):
+    C0=100,  C1=50,  C2=200,  C3=80,  C4=150,  C5=60
+
+  两层合并 (len=2):
+    [C0,C1]: 120 ✓ (100+50=150, 合了省 GDMA)
+    [C1,C2]: 230 ✓ (50+200=250)
+    [C2,C3]: MAX ✗ (L2 Conv + L3 Pool 不兼容，H margin 冲突)
+    [C3,C4]: 200 ✓ (80+150=230)
+    [C4,C5]: 180 ✓ (150+60=210)
+
+  三层合并 (len=3):
+    [C0,C1,C2]: 300 ✓
+    [C1,C2,C3]: MAX ✗ (C2,C3 不兼容)
+    [C2,C3,C4]: MAX ✗
+    [C3,C4,C5]: 280 ✓
+
+  四层及以上: 只要包含 C2+C3 的区间 = MAX
+
+Step 4: DP 递推填表
+
+  len=1 初始化:
+    cost_table[i][i] = 单 cluster cost
+    cut_points[i][i] = i
+
+  len=2:
+    [0,1]: single=120, sweep[0]: 100+50=150 → cost=120, cut=1 (不切)
+    [1,2]: single=230, sweep[1]: 50+200=250 → cost=230, cut=2 (不切)
+    [2,3]: single=MAX, sweep[2]: 200+80=280 → cost=280, cut=2 (切开!)
+    [3,4]: single=200, sweep[3]: 80+150=230 → cost=200, cut=4 (不切)
+    [4,5]: single=180, sweep[4]: 150+60=210 → cost=180, cut=5 (不切)
+
+  len=3:
+    [0,2]: single=300, sweep[0]:100+230=330, sweep[1]:120+200=320
+           → cost=300, cut=2 (不切)
+    [1,3]: single=MAX, sweep[1]:50+280=330, sweep[2]:230+80=310
+           → cost=310, cut=2 (切开)
+    [2,4]: single=MAX, sweep[2]:200+200=400, sweep[3]:280+150=430
+           → cost=400, cut=2 (切开)
+    [3,5]: single=280, sweep[3]:80+180=260, sweep[4]:200+60=260
+           → cost=260, cut=3 (切开)
+
+  ... 依次递推至 len=6 ...
+
+  最终 cost_table[0][5] 的计算:
+    single=MAX
+    sweep[0]: 100+490=590
+    sweep[1]: 120+460=580
+    sweep[2]: 300+260=560  ← 最小！
+    sweep[3]: 380+180=560
+    sweep[4]: 500+60=560
+    → cost=560, cut=2
+
+Step 5: 回溯提取
+
+  从 cut_points[0][5] = 2 开始:
+    [0,5]: cut=2≠5 → 切开
+      [0,2]: cut=2=2 → 不切，Group A = [C0, C1, C2] = [L0, L1, L2]
+      [3,5]: cut=3≠5 → 切开
+        [3,3]: cut=3=3 → 不切，Group B = [C3] = [L3]
+        [4,5]: cut=5=5 → 不切，Group C = [C4, C5] = [L4, L5]
+
+  最终 cut_result = {2, 3, 5}，即 3 个 Group:
+
+    ┌─────────────────┐  ┌──────┐  ┌──────────┐
+    │ Group A          │  │ Grp B │  │ Group C   │
+    │ L0→L1→L2        │  │  L3   │  │ L4→L5     │
+    │ cost = 300       │  │cost=80│  │ cost = 180 │
+    └─────────────────┘  └──────┘  └──────────┘
+
+  总 cost = 300 + 80 + 180 = 560
+
+Step 6: 局部搜索（如果启用）
+
+  移板子: 尝试将 cut=2 左移 → cut=1 (120+280=400 ✗), cut=0 (100+310=410 ✗) → 不动
+         尝试将 cut=3 左移 → cut=2 (200+260=460 ✗) → 不动
+
+  删板子: 尝试合并 Group B + Group C → cost([3,4,5])=280 > 80+180=260 ✗ → 不删
+         尝试合并 Group A + Group B → [0,1,2,3]=MAX ✗ → 不删
+
+  最终方案不变: {2, 3, 5}
+
+A.3 第二阶段：对 Group A 做微观验证（is_layer_group_valid 内部）
+
+以 Group A = [L0(Conv), L1(Add), L2(Conv)] 为例。
+
+Step 1: init_group_data_secs()
+
+  遍历 Group 内每个 OP 算总 buffer 大小:
+
+    L0 (Conv2D):
+      input[0]   = 1×64×56×56×4 = 802,816 字节 (FP32)
+      output[0]  = 1×64×56×56×4 = 802,816 字节
+      权重         = 64×64×3×3×4 = 147,456 字节
+      中间 buffer  ≈ 200,000 字节 (im2col等)
+      total(L0)  ≈ 1,953,088 字节 ≈ 1.86 MB
+
+    类似地计算 L1 (Add): ~0.8 MB, L2 (Conv2D): ~1.5 MB
+
+    取最大值: ~1.95 MB
+
+  LMEM_BYTES = 256KB × 64 NPU ≈ 16 MB (整个逻辑视角)
+  total_secs = ceil(1.95MB / 16MB) = 1
+
+  → 不需要切！shape_secs = {nsecs=1, csecs=1, dsecs=1, hsecs=1, wsecs=1}
+
+  注：如果该 Group 包含的 Conv 输入更大（如 112×112），total_secs 可能 = 2
+  → nsecs=2 或 hsecs=2，则进入切分流程。
+
+Step 2: assignTimeStep() —— 反向推断 + 时间步分配
+
+  2a. backward_update_slice():
+
+    Group 输出 = L2(Conv2D) 的 output, H=56
+    因为 hsecs=1 → 不切, slice = [(0, 56)]
+
+    BFS 反向推断:
+      对 L2: 找 L2 的输入（即 L1 的输出）
+        Conv2D BackwardH: 输入需要 [0,56)+margin → [0,58)
+        (kernel=3, stride=1, pad=1 → margin=2)
+      → L1 输出 tensor 的 H: [(0, 58)]
+
+      对 L1: L1 是逐元素 (Add)，输入 = L0 的输出
+        Add BackwardH: 一一对应，[0,58)
+      → L0 输出 tensor 的 H: [(0, 58)]
+
+      对 L0: L0 的输入 = Group 的输入（来自 DDR）
+        Conv2D BackwardH: [0,58)+margin=[0,60)
+      → Group 输入 H: [(0, 60)]
+
+    注意：hsecs=1 时每维只有一个 tile，没有 margin 重叠的问题。
+    如果 hsecs=2，每个 tile 会有不同的 offset，margin 重叠就会显现。
+    详见《反向推断Tensor大小流程说明.txt》中的 Conv→Pool→Conv 多 tile 示例。
+
+  2b. Layer Nearest 时间步分配:
+
+    3 个 OP → 每个 OP 一个 TS:
+
+      TS 0:  BDC[空]           GDMA[Load L0.input, L0.weight]
+      TS 1:  BDC[L0(Conv2D)]   GDMA[Load L1.weight (如果有)]
+      TS 2:  BDC[L1(Add)]      GDMA[Load L2.weight]
+      TS 3:  BDC[L2(Conv2D)]   GDMA[Load 下一轮/空]
+      TS 4:  BDC[空]           GDMA[Store L2.output]
+
+  2c. Software Pipeline (3-Stage):
+
+    消除 TS 0 和 TS 4 的 BDC 空转:
+
+      TS 1:  BDC[L0]  GDMA[Load L1.weight / 预加载]
+      TS 2:  BDC[L1]  GDMA[Store 前一tile结果 (如果有切片)]
+      TS 3:  BDC[L2]  GDMA[Load 下一轮]
+      TS 4:  BDC[L3?] GDMA[Load...]   ← 如果有切片，继续流水
+
+    因为本例 hsecs=1（不切），只有一轮计算，Software Pipeline 退化为
+    单轮串行。多 tile 场景下 Software Pipeline 的效果才会显现。
+
+  2d. Memory Aware 负载均衡:
+
+    计算每个 TS 的 BDC 耗时和 GDMA 耗时，求 slack:
+      TS 1: BDC(Conv2D, 慢) vs GDMA(Load, 快) → slack > 0, BDC 瓶颈
+      TS 2: BDC(Add, 快) vs GDMA(Load, 慢) → slack < 0, GDMA 瓶颈
+
+    如果 slack 失衡 → 把 TS 2 的 GDMA 操作往前挪到 TS 1（趁 Conv 慢时多搬）
+
+  输出: timestep_table_ + lmem_buffer_
+
+Step 3: assignLmemAddrWithSecs() —— LMEM 地址分配
+
+  假设经过时间步分配后，需要分配以下 buffer:
+
+    buffer      存活时间        大小      说明
+    ───────     ────────────    ──────    ──────────────────────────
+    input       TS 1 ~ 1       800 KB    Group 输入 (L0 消费)
+    w0          TS 1 ~ 1       150 KB    L0 权重
+    L0_out      TS 1 ~ 2       800 KB    L0 输出 (L1 消费, TS 2)
+    L1_out      TS 2 ~ 3       500 KB    L1 输出 (L2 消费, TS 3)
+    w2          TS 2 ~ 3       200 KB    L2 权重
+    output      TS 3 ~ 3       500 KB    Group 输出 (STORE)
+
+  地址分配流程（详见《分配地址.txt》）:
+    ① 建冲突堆: npu_heap[ts] = TS ts 的 BDC buffer
+                gdma_heap[ts] = TS ts 的 GDMA buffer
+    ② 排序: conflict↓ → area↓ → start_ts↑
+    ③ 贪心分配: 每轮选地址最小的 buffer 分配
+    ④ Bank conflict 规避: GDMA vs BDC 不能共享 bank
+
+  最终 LMEM 布局（示意）:
+
+    地址:    0        800K    950K    1750K   2250K   2750K
+            ├────────┼───────┼───────┼───────┼───────┤
+    TS 1:   │ input  │  w0   │ L0_out│ (空)   │       │
+    TS 2:   │  (空)  │  w0*  │ L0_out│ L1_out│       │
+    TS 3:   │  (空)  │       │ (空)  │ L1_out│ w2  │ output │
+            └────────┴───────┴───────┴───────┴───────┴───────┘
+
+    注: w0 在 TS 2 仍被 Add 使用（作为广播输入），L1_out 计算后原地
+        复用 L0_out 的部分空间（如果 inplace 可行）
+
+Step 4: CycleCalculator 计算总周期
+
+  hsecs=1 → 只有一轮迭代，无流水:
+
+    total_cycle = max(BDC_cycle, GDMA_cycle) × 1
+
+  CycleCalculator 把这个 cost 返回给 is_layer_group_valid()，
+  is_layer_group_valid() 返回给 DP 算法作为 cost_table 中的值。
+
+A.4 最终输出
+
+  对每个 Group，最终 is_layer_group_valid() 确定了:
+    · shape_secs: 切分方案
+    · timestep_table_: BDC/GDMA 的调度表
+    · lmem_buffer_: 每个 buffer 的 LMEM 地址
+    · group_cost: 执行周期
+
+  所有 Group 的 lg_infos 交给后续 Pass:
+    · GroupOps: 把 Group 写成 MLIR 的 tpu.GroupOp
+    · Codegen: 生成最终的 bmodel 指令
+
+A.5 完整流程可视化
+
+  输入: subnet_ops [L0, L1, L2, L3, L4, L5] (6层)
+      │
+      ▼
+  ┌─────────────────────────────┐
+  │ get_base_groups()           │  1 个 base_group
+  └────────────┬────────────────┘
+               │
+               ▼
+  ┌─────────────────────────────┐
+  │ 聚合 → Clusters             │  max_cluster_size=1
+  │ C0..C5 (每层一个cluster)     │  不聚合
+  └────────────┬────────────────┘
+               │
+               ▼
+  ┌─────────────────────────────────────────────┐
+  │ DP: 预计算 single_group_costs (并行)          │
+  │   [C0,C1]=120, [C1,C2]=230, [C2,C3]=MAX ...│
+  │                                             │
+  │ DP: 填 cost_table / cut_points               │
+  │   cost_table[0][5] = 560, cut = 2           │
+  │                                             │
+  │ 回溯: cut_result = {2, 3, 5}                │
+  └────────────┬────────────────────────────────┘
+               │
+               ▼
+  ┌─────────────────────────────┐
+  │ 局部搜索（移板子/删板子）      │  结果不变
+  └────────────┬────────────────┘
+               │
+               ▼
+  ┌─────────────────────────────────────────────┐
+  │ 最终 Group 划分:                              │
+  │                                             │
+  │  Group A [L0, L1, L2]  Group B [L3]  Group C [L4, L5]
+  │  shape_secs=(1,1,1,1,1)  (1,1,1,1,1)  (1,1,1,1,1)
+  │  cost=300                cost=80       cost=180
+  │                                             │
+  │  总 cost = 560                               │
+  └─────────────────────────────────────────────┘
+
+A.6 关键观察
+
+  1. C2 和 C3 不兼容是决定最终方案的"断层"：
+     如果 Conv2D(L2) 和 Pool2D(L3) 能兼容，整个 6 层可能合成一个 Group。
+     因为 C2/C3 不兼容，DP 必须在 C2 后面切一刀。
+
+  2. "合"的局限：
+     hsecs=1 的例子中不需要切分，因此反向推断和流水线都很简单。
+     当 hsecs>1 时（如较大输入），每个 tile 有不同的 offset 和 margin，
+     多 tile 之间的 Software Pipeline 重叠效果才会显现。
+
+  3. 两阶段的分工：
+     第一阶段（宏观）决定"谁和谁在一组"——一个组合优化问题；
+     第二阶段（微观）决定"每个组怎么切、怎么调度"——一个资源分配问题。
+     两者通过 cost（执行周期）耦合：宏观搜索不断试不同的分组，微观每次
+     算出一个 cost 供宏观比较。
+
+================================================================================
