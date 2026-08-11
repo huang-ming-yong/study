@@ -1,0 +1,141 @@
+============================================================
+A组 第七周：源码走读 — 一条算子的完整生命周期
+============================================================
+
+目标：从"用工具的人"变成"看得懂编译器源码的人"
+产出：一篇源码走读笔记 + 指出一个可优化的瓶颈点
+
+============================================================
+三大块内容（并行推进，不用按顺序）
+============================================================
+
+一、MLIR 核心概念（理论底子）
+
+  学什么：
+  - IR / SSA / Basic Block 是什么
+  - Operation / Region / Block 的关系
+  - TableGen (.td) 怎么定义算子
+  - Pass / PassManager / Pattern Rewrite 怎么对 IR 做变换
+  - 核心理念：编译器 = 一串对 IR 做变换的 Pass
+
+  怎么学：
+  → 读 MLIR Toy Tutorial Ch.3-6（mlir.llvm.org/docs/Tutorials/Toy）
+  → 对着 tpu-mlir 代码看，不要干读理论
+    · TopOps.td（include/tpu_mlir/Dialect/Top/IR/TopOps.td）= TableGen 定义 Top 方言
+    · TopOps.td 里搜 "def Conv" 看一个算子在 TableGen 里长什么样
+
+  够用标准
+  能说清"一个 Conv 算子从 TableGen 定义到 C++ 实现的对应关系"
+
+------------------------------------------------------------
+
+二、前端路径（ONNX → Top IR，知道模型怎么进来的）
+
+  学什么：
+  - ONNX 模型被读到后，每个 ONNX 算子怎么映射成 Top Dialect 算子
+  - MLIR 的 IR 是怎么被构建出来的
+
+  读哪些文件：
+  → python/tools/model_transform.py    —— 命令行入口，了解整体流程
+  → python/transform/OnnxConverter.py  —— ONNX 算子→Top 算子 的转换逻辑
+  → python/transform/BaseConverter.py  —— 基类，通用转换方法
+  → python/transform/MLIRImporter.py   —— 生成 MLIR IR 的工具
+
+  怎么学：
+  → 以 Conv 为例：在 OnnxConverter.py 里搜 "Conv"，看在哪个函数处理的
+  → 跟着调用链往下追，每遇到一个文件记一句"这个文件干了什么"
+
+  够用标准：
+  能画出：ONNX Conv → 前端转换 → Top Dialect 里的 top.Conv Op
+
+------------------------------------------------------------
+
+三、算子的编译管线（Top → Tpu → Codegen，一条算子的完整生命周期）
+
+  以 Conv 为例，按以下文件逐个读。每读完一个，用一句话记"输入是什么，输出是什么"：
+
+  [1] Top 层定义
+      文件：include/tpu_mlir/Dialect/Top/IR/TopOps.td
+      看：搜 "def Conv"，看 Conv 算子的输入/输出/属性定义
+
+  [2] Top 层接口实现
+      文件：lib/Dialect/Top/Interfaces/Conv.cpp
+      看：shape 推断、量化参数计算等通用逻辑
+
+  [3] Top 层图优化（Canonicalize / 融合）
+      文件：lib/Dialect/Top/Canonicalize/Conv.cpp
+      看：Conv+BN 融合、Conv+Relu 融合等 pattern 怎么写
+      文件：lib/Dialect/Top/Transforms/ProcessorOptimize/OptimizeBM1684X.cpp
+      看：针对 BM1684X 芯片的特殊图优化
+
+  [4] Top→Tpu Lowering（关键！）
+      文件：lib/Conversion/TopToTpu/BM1684X/Conv.cpp
+      看：top.Conv 怎么变成 tpu.Conv
+      重点对比：F16 路径 vs INT8 路径的区别
+      思考：量化 lowering 时，weight 怎么量化的？scale/zero_point 从哪来？
+
+  [5] Tpu 层优化 + LayerGroup（切分调度，性能命门）
+      目录：lib/Dialect/Tpu/Transforms/LayerGroup/
+      关键文件：
+        GroupMethod.cpp       —— 分组策略：哪些算子分到一组
+        LmemAllocator.cpp     —— local memory 分配：张量怎么塞进片上内存
+        TimeStepMethod.cpp    —— 时间步流水：组内算子怎么流水执行
+        CycleCalculator.cpp   —— cost model：预估每组耗时
+      怎么读：打开 debug 输出，跑一次 resnet18，看日志里 LayerGroup 怎么切
+
+  [6] Codegen（最后一步，生成 bmodel）
+      目录：lib/Dialect/Tpu/Transforms/Codegen/
+      关键文件：BM168xCodegen.cpp、AddressAssign.cpp
+      看：IR 怎么变成最终二进制指令和地址分配
+
+------------------------------------------------------------
+
+四、核心学习方法
+
+  1. 以 Conv 为线索串所有文件 —— 每个文件都围绕同一个算子，形成一条线
+  2. 每读完一个文件，用一句话记笔记（不要抄代码，写"这个文件做了什么"）
+  3. 画图：一条时间线，Conv 在每个阶段变成了什么样子
+  4. 碰到不懂的类/函数，用 grep 搜定义，别猜
+
+  带着这些问题读：
+  - INT8 量化路径和 F16 路径在 lowering 时有什么不同？
+  - LayerGroup 凭什么决定哪些算子分到一组？
+  - 如果 local memory 放不下一个 tensor，代码里怎么处理？
+  - 从 IR 到 bmodel 二进制，中间少了什么信息？加了什么信息？
+
+============================================================
+硬性产出（gate，不过不进阶段4）
+============================================================
+
+  [产出1] 一篇源码走读笔记
+    内容：Conv 算子 从 ONNX → Top IR → Tpu IR → Codegen → bmodel 的完整路径
+    形式：流程图 + 每步一句话说明，标注"输入→做了什么→输出"
+
+  [产出2] 指出一个可优化的瓶颈点（具体、可论证）
+    例如：
+    - LayerGroup 对某类算子的分组策略不好，local memory 利用率低
+    - Conv+BN 融合漏了某种常见 pattern
+    - INT8 量化对某些层精度损失过大，校准方法可改进
+    - lowering 时某处多了不必要的内存拷贝
+
+============================================================
+关键文件速查
+============================================================
+
+  TopOps 定义    │ include/tpu_mlir/Dialect/Top/IR/TopOps.td
+  Top 接口       │ lib/Dialect/Top/Interfaces/Conv.cpp
+  Top 融合       │ lib/Dialect/Top/Canonicalize/Conv.cpp
+  芯片优化       │ lib/Dialect/Top/Transforms/ProcessorOptimize/OptimizeBM1684X.cpp
+  Top→Tpu        │ lib/Conversion/TopToTpu/BM1684X/Conv.cpp
+  LayerGroup     │ lib/Dialect/Tpu/Transforms/LayerGroup/
+  Codegen        │ lib/Dialect/Tpu/Transforms/Codegen/
+  前端入口       │ python/tools/model_transform.py
+  ONNX转换       │ python/transform/OnnxConverter.py
+
+============================================================
+第八周衔接（先看一眼）
+============================================================
+
+  第七周两人同读 Conv 路径 → 第八周分工：
+  A1（量化）： python/calibration/（kld_calibrator, mix_precision, search_qtable）
+  A2（切分）： LayerGroup 深挖（GroupMethod, LmemAllocator, CycleCalculator）

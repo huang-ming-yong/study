@@ -1,0 +1,190 @@
+========================================================================
+Conv.cpp 逐行讲解 —— 以 Conv1dTo2d 为例
+========================================================================
+
+场景：ONNX 里有 1D 卷积，但 BM1684X 只支持 2D 卷积。
+      这个 Pass 就是把 1D 卷积伪造成 2D 卷积 —— 在 kernel 末尾补一维 1。
+
+比如 kernel_shape 原来 = [3]，改成 [3, 1]，板子就能跑了。
+
+
+========================================================================
+完整的骨架结构（所有规则都一样）
+========================================================================
+
+  struct XxxPattern : public OpRewritePatternEx<ConvOp> {     // 1. 定义一个规则
+    matchAndRewriteImpl(ConvOp op, PatternRewriter &rewriter) {
+      // 2. 检查：是不是我要处理的场景？（不是 → return failure()）
+      // 3. 动手：修改算子的属性/输入/输出
+      // 4. return success()
+    }
+  };
+
+
+========================================================================
+逐行解释（行号对应 Conv.cpp 的实际行号）
+========================================================================
+
+第 16 行：
+┌─────────────────────────────────────────────────────────────
+│ struct Conv1dTo2d : public OpRewriterPatternEx<ConvOp> {
+└─────────────────────────────────────────────────────────────
+
+  定义一个类叫 Conv1dTo2d，继承自 OpRewriterPatternEx<ConvOp>。
+  意思是："这是一个专门匹配 Conv 算子的优化规则"。
+
+
+第 17 行：
+┌─────────────────────────────────────────────────────────────
+│   using OpRewriterPatternEx::OpRewriterPatternEx;
+└─────────────────────────────────────────────────────────────
+
+  不管你，这是 C++ 的"抄父类的构造函数"写法。固定套路。
+
+
+第 19-20 行：
+┌─────────────────────────────────────────────────────────────
+│   Conv1dTo2d(mlir::MLIRContext *context)
+│       : OpRewriterPatternEx<ConvOp>(context, "Conv1dTo2d") {}
+└─────────────────────────────────────────────────────────────
+
+  构造函数。给这个规则起个名字 "Conv1dTo2d"，方便调试时在日志里看到它。
+
+
+第 22-23 行：
+┌─────────────────────────────────────────────────────────────
+│   LogicalResult matchAndRewriteImpl(ConvOp op,
+│                                     PatternRewriter &rewriter) const override {
+└─────────────────────────────────────────────────────────────
+
+  核心函数。MLIR 框架每扫到一个 Conv 算子，就调用这个函数。
+  参数：
+    op      —— 当前被扫描到的 Conv 算子（比如你 .mlir 里的 %3 = top.Conv ...）
+    rewriter —— 工具，用来改 IR
+
+
+第 24 行：
+┌─────────────────────────────────────────────────────────────
+│     auto kernel = module::getI64Array(op.getKernelShape());
+└─────────────────────────────────────────────────────────────
+
+  拿到 Conv 的 kernel_shape 属性。
+  比如 .mlir 里写的是 kernel_shape = [3]，那就得到 [3]。
+
+
+第 25-27 行：
+┌─────────────────────────────────────────────────────────────
+│     if (kernel->size() != 1) {
+│       return failure();
+│     }
+└─────────────────────────────────────────────────────────────
+
+  "如果 kernel 不是 1 维的（比如 [3,3] 是 2 维），说明本身就是 2D，不需要我处理。"
+  return failure() = 跳过这个算子，不改它。
+
+
+第 28-31 行：
+┌─────────────────────────────────────────────────────────────
+│     std::vector<int64_t> vfilterShape = module::getShape(op.getFilter());
+│     vfilterShape.push_back(1);
+│     auto new_type = RankedTensorType::get(vfilterShape, rewriter.getF32Type());
+│     op.getFilter().setType(new_type);
+└─────────────────────────────────────────────────────────────
+
+  把权重的形状也补一维。比如原来 weight 是 [64, 3, 3]，
+  补成 [64, 3, 3, 1] —— 多了一维大小为 1。
+
+
+第 33-36 行：
+┌─────────────────────────────────────────────────────────────
+│     std::vector<int64_t> kernel_shape =
+│         *module::getI64Array(op.getKernelShape());
+│     kernel_shape.push_back(1);
+│     op.setKernelShapeAttr(rewriter.getI64ArrayAttr(kernel_shape));
+└─────────────────────────────────────────────────────────────
+
+  把 kernel_shape 属性也改了。原来 [3] → 改成 [3, 1]。
+
+
+第 37-48 行：
+┌─────────────────────────────────────────────────────────────
+│     strides.push_back(1);      // stride 也补 1
+│     pads = {...};              // padding 也补一维 0
+│     dilations.push_back(1);    // dilation 也补 1
+└─────────────────────────────────────────────────────────────
+
+  所有跟形状相关的属性（strides、pads、dilations）都补一维，
+  让 1D 卷积伪装成 2D 卷积。
+
+
+第 50 行：
+┌─────────────────────────────────────────────────────────────
+│     return success();
+└─────────────────────────────────────────────────────────────
+
+  "改完了，成功。"
+
+
+========================================================================
+用你已经看过的 .mlir 来理解
+========================================================================
+
+改写前（1D Conv）：
+  %3 = "top.Conv"(%0, %1, %2) {
+    kernel_shape = [3],      ← 1 维
+    strides = [2],
+    pads = [1, 1]
+  } ...
+
+改写后（伪造成 2D Conv）：
+  %3 = "top.Conv"(%0, %1, %2) {
+    kernel_shape = [3, 1],   ← 补成了 2 维
+    strides = [2, 1],
+    pads = [1, 0, 1, 0]      ← 4 个数，标准的 2D padding
+  } ...
+
+板子看到的就是标准 2D 卷积了，虽然有一维大小是 1（等于空转），但能跑。
+
+
+========================================================================
+对比：Toy Tutorial 的骨架 vs Conv.cpp 的实际代码
+========================================================================
+
+  Toy Tutorial（简化）:
+    struct SimplifyRedundantTranspose : public OpRewritePattern<TransposeOp> {
+      matchAndRewrite(TransposeOp op, ...) {
+        if (不是我要的 pattern) return failure();
+        修改 op
+        return success();
+      }
+    };
+
+  Conv.cpp（实际代码）:
+    struct Conv1dTo2d : public OpRewritePatternEx<ConvOp> {
+      matchAndRewriteImpl(ConvOp op, ...) {
+        if (kernel->size() != 1) return failure();    ← 不是 1D → 不管
+        修改 kernel/strides/pads/dilations             ← 全补一维
+        return success();
+      }
+    };
+
+  区别只有两点:
+    1. 基类名：OpRewritePattern  →  OpRewriterPatternEx（tpu-mlir 自己包装的）
+    2. 函数名：matchAndRewrite   →  matchAndRewriteImpl
+
+  其余思路完全一样："匹配条件 → 不满足就跳过 → 满足就修改 → 返回成功"。
+
+
+========================================================================
+Conv.cpp 文件底部的注册行（第 673 行）
+========================================================================
+
+  void ConvOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                           MLIRContext *context) {
+    results.insert<Conv3dTranspose, Conv3dTo2d, Conv1dTo2d,
+                   Conv1x1Convkxk2dMerge, ConvReshapeSlicePattern>(context);
+  }
+
+  这一行的意思是："把这些规则全部注册到 Canonicalization 框架里。"
+  框架会在 IR 上反复扫描，每碰到一个 Conv 算子就挨个试这些规则，
+  直到 IR 不再变化为止。
