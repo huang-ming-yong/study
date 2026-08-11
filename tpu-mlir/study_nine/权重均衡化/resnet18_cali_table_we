@@ -1,0 +1,43 @@
+# mlir version: v1.0.0.dev-403630b88-20260602 cali version 1.0
+# mlir: resnet18.mlir
+# genetated time: 2026-07-29 16:16:22.139019
+# quantization threshold calculation method: ['kl']
+# histogram number: 2048
+# sample number: 100
+###
+# tune number: 5
+###
+# op_name    threshold    min    max
+data 2.6355782 -2.1148427 2.6355782
+resnetv15_relu0_fwd_Relu 3.4114980 -0.0000000 4.9697413
+resnetv15_pool0_fwd_MaxPool 3.2529006 -0.0000000 4.9697413
+resnetv15_stage1_relu0_fwd_Relu 3.3564270 -0.0000000 5.6115632
+resnetv15_stage1_conv1_fwd_Conv 4.3170114 -7.9233227 4.8630023
+resnetv15_stage1_activation0_Relu 4.3303328 0.0000000 5.9319258
+resnetv15_stage1_relu1_fwd_Relu 4.0266809 -0.0000000 5.6356382
+resnetv15_stage1_conv3_fwd_Conv 3.9160659 -5.6933146 5.6864796
+resnetv15_stage1_activation1_Relu 5.1614623 0.0000000 6.6887159
+resnetv15_stage2_conv2_fwd_Conv 2.5566330 -4.4421215 2.8937235
+resnetv15_stage2_relu0_fwd_Relu 5.8869371 -0.0000000 8.8327684
+resnetv15_stage2_conv1_fwd_Conv 2.5674181 -3.2894480 4.5228982
+resnetv15_stage2_activation0_Relu 3.9725885 0.0000000 5.3071146
+resnetv15_stage2_relu1_fwd_Relu 4.6153603 -0.0000000 6.7417769
+resnetv15_stage2_conv4_fwd_Conv 3.3767648 -4.5714717 4.2633920
+resnetv15_stage2_activation1_Relu 4.6912532 0.0000000 7.0669665
+resnetv15_stage3_conv2_fwd_Conv 1.9687103 -1.3189540 1.9687103
+resnetv15_stage3_relu0_fwd_Relu 3.4768503 -0.0000000 5.3941622
+resnetv15_stage3_conv1_fwd_Conv 2.4779046 -3.0232112 5.1730061
+resnetv15_stage3_activation0_Relu 3.4313419 0.0000000 5.8198066
+resnetv15_stage3_relu1_fwd_Relu 3.1889655 -0.0000000 4.8729763
+resnetv15_stage3_conv4_fwd_Conv 3.4106319 -4.4811549 3.7982829
+resnetv15_stage3_activation1_Relu 3.1343875 0.0000000 5.6595602
+resnetv15_stage4_conv2_fwd_Conv 2.2742431 -2.2742431 2.1070530
+resnetv15_stage4_relu0_fwd_Relu 3.9173230 -0.0000000 5.1715908
+resnetv15_stage4_conv1_fwd_Conv 3.1526101 -5.0605302 4.6848531
+resnetv15_stage4_activation0_Relu 4.0808072 0.0000000 5.6144152
+resnetv15_stage4_relu1_fwd_Relu 11.7047364 -0.0000000 11.9046040
+resnetv15_stage4_conv4_fwd_Conv 22.1408691 -16.1939144 34.9295044
+resnetv15_stage4_activation1_Relu 17.8065071 0.0000000 37.5820770
+resnetv15_pool1_fwd_GlobalAveragePool 9.7445602 0.0000000 9.7445602
+flatten_170_Flatten 9.7445602 0.0000000 9.7445602
+resnetv15_dense0_fwd_Gemm 31.0189438 -10.4832983 31.0189438

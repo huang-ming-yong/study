@@ -1,0 +1,71 @@
+说明：
+     1,从modelscope下载下来的模型是bf16不能量化为f16，会报错，需要先转换模型为f16
+     2
+
+
+
+
+1,下载模型
+https://www.modelscope.cn/models/LLM-Research/Llama-3.2-3B-Instruct
+
+python3 -c "
+from modelscope import snapshot_download
+snapshot_download('LLM-Research/Llama-3.2-3B-Instruct', local_dir='Llama-3.2-3B-Instruct')
+"
+
+由bf16模型转换为f16
+python3 -c "
+import torch
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    'Llama-3.2-3B-Instruct',
+    torch_dtype=torch.float16,
+    low_cpu_mem_usage=True
+)
+model.save_pretrained('Llama-3.2-3B-Instruct-fp16')
+print('Done: model saved to Llama-3.2-3B-Instruct-fp16')
+"
+
+
+
+2,编译
+W4
+llm_convert.py \
+  -m Llama-3.2-3B-Instruct-fp16 \
+  -s 1024 \
+  -q w4f16 \
+	-c bm1684x \
+  -o llama3.2_3b_w4
+
+W8
+llm_convert.py \
+  -m Llama-3.2-3B-Instruct-fp16 \
+  -s 1024 \
+  -q w8f16 \
+  -c bm1684x \
+  -o llama3.2_3b_w4f16
+
+
+
+
+3,配置LLM-TPU
+
+学会新装一个环境，不要动原来环境
+
+conda create -n tpu python=3.10 -y
+conda activate tpu
+
+ 安装编译依赖
+pip install pybind11
+pip install transformers==4.37.0 sentencepiece==0.1.99 jinja2
+
+装完之后，用这个命令 cmake（自动找到 pybind11 路径）：
+cmake .. -Dpybind11_DIR=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())")
+make && cp chat*.cpython*.so .. && cd ..
+
+python3 pipeline.py
+-m bmodel
+-c config
+
+

@@ -1,0 +1,80 @@
+INFO:root:
+  load_config Preprocess args : 
+	resize_dims           : [256, 256]
+	keep_aspect_ratio     : False
+	keep_ratio_mode       : letterbox
+	pad_value             : 0
+	pad_type              : center
+	input_dims            : [224, 224]
+	--------------------------
+	mean                  : [123.675, 116.28, 103.53]
+	scale                 : [0.0171, 0.0175, 0.0174]
+	--------------------------
+	pixel_format          : rgb
+	channel_format        : nchw
+	yuv_type              : 
+
+INFO:root:Cross Layer WE: resnetv15_stage1_relu0_fwd_Relu --- resnetv15_stage1_conv1_fwd_Conv Groups: 1 Iter: 1
+INFO:root:>>>loss:7.668483734130859
+INFO:root:Cross Layer WE: resnetv15_stage1_relu0_fwd_Relu --- resnetv15_stage1_conv1_fwd_Conv Groups: 1 Iter: 2
+INFO:root:>>>loss:8.436011853518721e-07
+INFO:root:Cross Layer WE: resnetv15_stage1_relu1_fwd_Relu --- resnetv15_stage1_conv3_fwd_Conv Groups: 1 Iter: 1
+INFO:root:>>>loss:16.656691074371338
+INFO:root:Cross Layer WE: resnetv15_stage1_relu1_fwd_Relu --- resnetv15_stage1_conv3_fwd_Conv Groups: 1 Iter: 2
+INFO:root:>>>loss:7.816275342520385e-07
+INFO:root:Cross Layer WE: resnetv15_stage2_relu0_fwd_Relu --- resnetv15_stage2_conv1_fwd_Conv Groups: 1 Iter: 1
+INFO:root:>>>loss:13.031278133392334
+INFO:root:Cross Layer WE: resnetv15_stage2_relu0_fwd_Relu --- resnetv15_stage2_conv1_fwd_Conv Groups: 1 Iter: 2
+INFO:root:>>>loss:9.506777587375836e-07
+INFO:root:Cross Layer WE: resnetv15_stage2_relu1_fwd_Relu --- resnetv15_stage2_conv4_fwd_Conv Groups: 1 Iter: 1
+INFO:root:>>>loss:15.427346229553223
+INFO:root:Cross Layer WE: resnetv15_stage2_relu1_fwd_Relu --- resnetv15_stage2_conv4_fwd_Conv Groups: 1 Iter: 2
+INFO:root:>>>loss:1.4736147022631485e-06
+INFO:root:Cross Layer WE: resnetv15_stage3_relu0_fwd_Relu --- resnetv15_stage3_conv1_fwd_Conv Groups: 1 Iter: 1
+INFO:root:>>>loss:12.09113073348999
+INFO:root:Cross Layer WE: resnetv15_stage3_relu0_fwd_Relu --- resnetv15_stage3_conv1_fwd_Conv Groups: 1 Iter: 2
+INFO:root:>>>loss:1.6374262372664816e-06
+INFO:root:Cross Layer WE: resnetv15_stage3_relu1_fwd_Relu --- resnetv15_stage3_conv4_fwd_Conv Groups: 1 Iter: 1
+INFO:root:>>>loss:22.844951629638672
+INFO:root:Cross Layer WE: resnetv15_stage3_relu1_fwd_Relu --- resnetv15_stage3_conv4_fwd_Conv Groups: 1 Iter: 2
+INFO:root:>>>loss:2.4309811124112457e-06
+INFO:root:Cross Layer WE: resnetv15_stage4_relu0_fwd_Relu --- resnetv15_stage4_conv1_fwd_Conv Groups: 1 Iter: 1
+INFO:root:>>>loss:64.52565956115723
+INFO:root:Cross Layer WE: resnetv15_stage4_relu0_fwd_Relu --- resnetv15_stage4_conv1_fwd_Conv Groups: 1 Iter: 2
+INFO:root:>>>loss:3.6871073234578944e-06
+INFO:root:Cross Layer WE: resnetv15_stage4_relu1_fwd_Relu --- resnetv15_stage4_conv4_fwd_Conv Groups: 1 Iter: 1
+INFO:root:>>>loss:333.7443313598633
+INFO:root:Cross Layer WE: resnetv15_stage4_relu1_fwd_Relu --- resnetv15_stage4_conv4_fwd_Conv Groups: 1 Iter: 2
+INFO:root:>>>loss:7.774010327921133e-06
+INFO:root:
+  load_config Preprocess args : 
+	resize_dims           : [256, 256]
+	keep_aspect_ratio     : False
+	keep_ratio_mode       : letterbox
+	pad_value             : 0
+	pad_type              : center
+	input_dims            : [224, 224]
+	--------------------------
+	mean                  : [123.675, 116.28, 103.53]
+	scale                 : [0.0171, 0.0175, 0.0174]
+	--------------------------
+	pixel_format          : rgb
+	channel_format        : nchw
+	yuv_type              : 
+
+INFO:root:
+  load_config Preprocess args : 
+	resize_dims           : [256, 256]
+	keep_aspect_ratio     : False
+	keep_ratio_mode       : letterbox
+	pad_value             : 0
+	pad_type              : center
+	input_dims            : [224, 224]
+	--------------------------
+	mean                  : [123.675, 116.28, 103.53]
+	scale                 : [0.0171, 0.0175, 0.0174]
+	--------------------------
+	pixel_format          : rgb
+	channel_format        : nchw
+	yuv_type              : 
+
